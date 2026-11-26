@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.4';
+const VERSION = '1.7.5';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -192,7 +192,10 @@ const state = {
     codePending: null,
     codeViewHandlers: new Map(),
     codeHydrateRaf: 0,
+    codeHydrateTimer: 0,
     codeIO: null,
+    codeInsertObserver: null,
+    codeInsertTarget: null,
     codeFormatterHooked: false,
     codeRerenderPending: false,
     codeScanDone: false,
@@ -1109,6 +1112,8 @@ function hydrateCodeView(pre) {
     };
     pre.addEventListener('scroll', onScroll, { passive: true });
     state.codeViewHandlers.set(pre, onScroll);
+    // 先同步画一帧，再下一帧校正；某些主题/浏览器会延迟 rAF，不能只等 rAF
+    renderCodeWindow(pre);
     requestAnimationFrame(() => renderCodeWindow(pre));
 }
 
@@ -1122,9 +1127,10 @@ function cleanupCodeView(pre) {
 
 function hydrateCodeViews() {
     const chat = chatEl();
-    if (!chat) return;
+    if (chat) ensureCodeInsertObserver(chat);
     const io = ensureCodeObserver();
-    chat.querySelectorAll('.al-code-full').forEach((block) => {
+    // 不只扫 #chat：角色卡预览/弹窗里也可能被 MessageFormatter 生成同样的空壳
+    document.querySelectorAll('.al-code-full').forEach((block) => {
         if (io && !block.__alIoObserved) {
             block.__alIoObserved = true;
             try { io.observe(block); } catch (err) { /* 忽略 */ }
@@ -1135,6 +1141,38 @@ function hydrateCodeViews() {
         block.dataset.alCodeReady = '1';
         hydrateCodeView(pre);
     });
+}
+
+/** 监听 .mes_text 内容写入：不依赖 ST 事件的先后顺序，空壳一落地就补水 */
+function ensureCodeInsertObserver(chat) {
+    if (!chat || state.disposed || typeof MutationObserver !== 'function') return;
+    if (state.codeInsertObserver && state.codeInsertTarget && state.codeInsertTarget.isConnected) return;
+    if (state.codeInsertObserver) {
+        try { state.codeInsertObserver.disconnect(); } catch (err) { /* 忽略 */ }
+    }
+    state.codeInsertTarget = chat;
+    state.codeInsertObserver = new MutationObserver((records) => {
+        if (!state.s || !isOn() || !state.s.codeDefer) return;
+        for (const record of records) {
+            // 只关心消息体里新插入/替换出来的代码块；代码行重建不触发补水
+            if (record.target && record.target.closest && record.target.closest('.al-code-full')) continue;
+            for (const node of record.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                const hit = (node.matches && node.matches('.al-code-full'))
+                    || (node.querySelector && node.querySelector('.al-code-full'));
+                if (hit) {
+                    hydrateCodeViews();
+                    scheduleCodeHydration();
+                    return;
+                }
+            }
+        }
+    });
+    try {
+        state.codeInsertObserver.observe(chat, { childList: true, subtree: true });
+    } catch (err) {
+        state.codeInsertObserver = null;
+    }
 }
 
 function ensureCodeObserver() {
@@ -1164,6 +1202,15 @@ function scheduleCodeHydration() {
     });
 }
 
+/** 极少数主题会把 .mes_text 的写入拖到 rAF 之后；给一个迟到兜底，避免永远停在“代码加载中” */
+function scheduleCodeHydrationFallback() {
+    if (state.codeHydrateTimer) return;
+    state.codeHydrateTimer = setTimeout(() => {
+        state.codeHydrateTimer = 0;
+        hydrateCodeViews();
+    }, 150);
+}
+
 function cleanupCodeViews() {
     for (const pre of state.codeViewHandlers.keys()) cleanupCodeView(pre);
     state.codeViewHandlers.clear();
@@ -1180,9 +1227,18 @@ function cleanupCodeViews() {
         try { state.codeIO.disconnect(); } catch (err) { /* 忽略 */ }
         state.codeIO = null;
     }
+    if (state.codeInsertObserver) {
+        try { state.codeInsertObserver.disconnect(); } catch (err) { /* 忽略 */ }
+        state.codeInsertObserver = null;
+        state.codeInsertTarget = null;
+    }
     if (state.codeHydrateRaf) {
         try { cancelAnimationFrame(state.codeHydrateRaf); } catch (err) { /* 忽略 */ }
         state.codeHydrateRaf = 0;
+    }
+    if (state.codeHydrateTimer) {
+        try { clearTimeout(state.codeHydrateTimer); } catch (err) { /* 忽略 */ }
+        state.codeHydrateTimer = 0;
     }
 }
 
@@ -1282,6 +1338,7 @@ function replaceCodeTokens(html) {
     }
     // 这一钩子返回后 ST 才把 HTML 写进 .mes_text；下一帧再补水，确保空壳已经在 DOM 里
     scheduleCodeHydration();
+    scheduleCodeHydrationFallback();
     return out;
 }
 
