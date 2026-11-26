@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.6';
+const VERSION = '1.7.7';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -1281,6 +1281,14 @@ function codeLang(info) {
     return first.replace(/[^\w+#.-]/g, '').slice(0, 24) || 'code';
 }
 
+/** 酒馆助手(JS-Slash-Runner)会把 <html>/<head>/<body> 的前端代码块接管成 iframe；
+ *  这类块不能提前替换成 raw 代码壳，否则酒馆助手只认原生 <pre><code>，会直接不渲染。
+ */
+function isFrontendCode(code) {
+    const text = String(code == null ? '' : code);
+    return text.includes('html>') || text.includes('<head>') || text.includes('<body');
+}
+
 function pruneCodeMessage(mesId) {
     const id = String(mesId);
     const keys = state.codeMesKeys.get(id);
@@ -1324,6 +1332,7 @@ function encodeHugeCodeFences(mes, context) {
     let total = 0;
     let max = 0;
     for (const m of matches) {
+        if (isFrontendCode(m[5])) continue;
         const chars = m[5].length;
         total += chars;
         if (chars > max) max = chars;
@@ -1340,6 +1349,8 @@ function encodeHugeCodeFences(mes, context) {
     for (const m of matches) {
         const body = m[5];
         const chars = body.length;
+        // 前端代码交给酒馆助手渲染 iframe；这里截走会让它只剩一个空代码块
+        if (isFrontendCode(body)) continue;
         if (!deferAll && chars < threshold) continue;
         index++;
         state.codeSeq++;
@@ -1448,7 +1459,10 @@ function convertRenderedHugeCode() {
         });
         if (!pres.length) return;
         let total = 0;
-        for (const pre of pres) total += (pre.querySelector('code')?.textContent || '').length;
+        for (const pre of pres) {
+            const raw = pre.querySelector('code')?.textContent || '';
+            if (!isFrontendCode(raw)) total += raw.length;
+        }
         const convertAll = totalThreshold > 0 && total >= totalThreshold;
         const mes = mesText.closest('.mes');
         const mesId = mes && mes.dataset.mesid ? mes.dataset.mesid : 'x';
@@ -1456,6 +1470,7 @@ function convertRenderedHugeCode() {
         for (const pre of pres) {
             const code = pre.querySelector('code');
             const raw = code.textContent || '';
+            if (isFrontendCode(raw)) continue;
             if (!convertAll && raw.length < threshold) continue;
             state.codeSeq++;
             const key = `alc${state.codeSeq}`;
