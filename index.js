@@ -1,5 +1,5 @@
 /**
- * AntiLag 流畅优化 v1.8.0 —— SillyTavern 扩展
+ * AntiLag 流畅优化 v1.9.0 —— SillyTavern 扩展
  *
  * 设计原则：
  * 1) 默认「轻度」模式视觉零改动，只做不改变观感的减负；
@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.8.0';
+const VERSION = '1.9.0';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -2011,15 +2011,19 @@ function buildPanel() {
             <div class="al-diag">
                 <div class="al-diag-head">
                     <b>运行体检</b>
-                    <button type="button" class="al-btn al-ghost al-small" id="al-scan">重新检测</button>
+                    <div class="al-diag-head-actions">
+                        <button type="button" class="al-btn al-ghost al-small" id="al-scan">重新检测</button>
+                        <button type="button" class="al-btn al-ghost al-small" id="al-copy">复制报告</button>
+                    </div>
                 </div>
                 <div class="al-diag-grid" data-grid></div>
                 <div class="al-advice" data-advice></div>
             </div>
 
             <div class="al-actions">
-                <button type="button" class="al-btn al-primary" id="al-optimize">一键均衡</button>
-                <button type="button" class="al-btn al-ghost" id="al-reset">恢复默认</button>
+                <button type="button" class="al-btn al-primary" id="al-recommend">智能推荐</button>
+                <button type="button" class="al-btn al-ghost" id="al-optimize">一键均衡</button>
+                <button type="button" class="al-btn al-ghost al-small" id="al-reset">恢复默认</button>
             </div>
             <div class="al-foot">不改角色卡、世界书与聊天内容；所有结构性操作都可用按钮还原。</div>
         </div>`;
@@ -2108,6 +2112,8 @@ function bindPanel() {
     });
     el.querySelector('#al-reset')?.addEventListener('click', resetSettings);
     el.querySelector('#al-scan')?.addEventListener('click', () => renderDiagnostics());
+    el.querySelector('#al-recommend')?.addEventListener('click', applyRecommended);
+    el.querySelector('#al-copy')?.addEventListener('click', copyDiagnosticReport);
     el.querySelector('[data-pause]')?.addEventListener('click', togglePause);
 }
 
@@ -2388,6 +2394,101 @@ function renderDiagnostics() {
     if (!tips.length) tips.push('当前状态良好，保持现有配置即可');
 
     advice.innerHTML = tips.map((t) => `<div class="al-tip">· ${t}</div>`).join('');
+}
+
+/* ------------------------------------------------------------------ */
+/* 智能推荐与体检报告                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 只推荐「不改外观」的选项：虚拟化、原生分页、流式降频、生成期关淡入/平滑、
+ * 懒加载、代码直出、角色字段 token 跳过。毛玻璃/阴影/过渡等视觉项不自动动。
+ */
+function recommendedPlan() {
+    const d = collectDiagnostics();
+    const total = Math.max(Number(d.chatLen) || 0, Number(d.mesDom) || 0);
+    let coarse = false;
+    try {
+        coarse = Boolean(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+    } catch (err) { /* 忽略 */ }
+
+    const rec = {
+        virtualize: true,
+        genLite: true,
+        lazyImg: true,
+        codeDefer: true,
+        streamFadeSkip: true,
+        smoothStreamSkip: true,
+        charTokenSkip: true,
+        preserveScroll: true,
+        streamFps: 15,
+    };
+    if (total >= 300) {
+        rec.nativeLimit = coarse ? 80 : 100;
+    }
+
+    return { rec, total, coarse, diagnostics: d };
+}
+
+function applyRecommended() {
+    if (!state.s) return;
+    const plan = recommendedPlan();
+    const changed = [];
+    for (const [key, value] of Object.entries(plan.rec)) {
+        if (state.s[key] !== value) {
+            state.s[key] = value;
+            changed.push(key);
+        }
+    }
+    // 推荐不碰模式里的视觉项；如果当前还在临时极速，先退出，避免看起来没生效
+    state.boost = false;
+    state.lowStreak = 0;
+    state.highStreak = 0;
+    save();
+    applyAll();
+    if (state.s.nativeLimit) rerenderChatSoon();
+    syncPanel();
+    renderDiagnostics();
+
+    const bits = [];
+    if (plan.rec.nativeLimit) bits.push(`原生分页 ${plan.rec.nativeLimit} 条`);
+    if (state.s.streamFps === 15) bits.push('流式上限 15 FPS');
+    if (state.s.smoothStreamSkip) bits.push('生成期关平滑流式');
+    if (state.s.streamFadeSkip) bits.push('生成期关淡入');
+    if (state.s.codeDefer) bits.push('大代码可视行');
+    const summary = bits.length ? bits.join('、') : '核心减负项';
+    if (changed.length === 0) {
+        toast('info', '当前已经是推荐配置，不需要再改');
+    } else {
+        toast('success', `已应用推荐：${summary}（不改外观）`);
+    }
+}
+
+function copyDiagnosticReport() {
+    const el = state.panelEl;
+    if (!el) return;
+    const grid = el.querySelector('[data-grid]');
+    const advice = el.querySelector('[data-advice]');
+    const d = collectDiagnostics();
+    const text = [
+        `AntiLag v${VERSION} 体检报告`,
+        new Date().toLocaleString(),
+        '',
+        grid ? grid.innerText : '',
+        '',
+        '运行建议：',
+        advice ? advice.innerText : '',
+        '',
+        `消息 ${d.chatLen} 条 / DOM ${d.mesDom} 条 / 节点 ${d.nodes}`,
+        `虚拟化 ${d.virtOn ? '开' : '关'} / 原生截断 ${d.nativeTrunc || '不限'}`,
+        `上次加载 ${d.loadMs ? Math.round(d.loadMs) + 'ms' : '—'} / 消息落地 ${d.renderMs ? Math.round(d.renderMs) + 'ms' : '—'}`,
+        `帧率 ${state.fps || '采样中'} / 10s 长任务 ${recentLongTasks().count} 次`,
+    ].join('\n');
+    writeClipboardText(text).then(() => {
+        toast('success', '体检报告已复制到剪贴板');
+    }).catch(() => {
+        toast('warning', '复制失败，请手动选择面板文字');
+    });
 }
 
 /* ------------------------------------------------------------------ */
