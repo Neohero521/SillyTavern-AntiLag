@@ -1,5 +1,5 @@
 /**
- * AntiLag 流畅优化 v1.6.1 —— SillyTavern 扩展
+ * AntiLag 流畅优化 v1.7.0 —— SillyTavern 扩展
  *
  * 设计原则：
  * 1) 默认「轻度」模式视觉零改动，只做不改变观感的减负；
@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.6.1';
+const VERSION = '1.7.0';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -66,6 +66,11 @@ const DEFAULTS = {
     truncAppliedValue: 0,
     clipLong: false,
     clipChars: 3000,
+    codeDefer: true,
+    codeDeferChars: 8000,
+    codeDeferTotalChars: 30000,
+    charTokenSkip: true,
+    charTokenSkipChars: 20000,
 
     pauseOnEdit: true,
     preserveScroll: true,
@@ -103,6 +108,8 @@ const TOGGLES = [
     ['al-killtrans', 'killTransitions'],
     ['al-contain', 'containChat'],
     ['al-trim', 'trimHistory'],
+    ['al-codedefer', 'codeDefer'],
+    ['al-chartokenskip', 'charTokenSkip'],
     ['al-clip', 'clipLong'],
     ['al-scrollidle', 'scrollIdle'],
     ['al-scrollblur', 'scrollBlur'],
@@ -118,6 +125,9 @@ const NUMBERS = [
     ['al-vmin', 'virtualizeMin', 30, 500],
     ['al-keep', 'trimKeep', 10, 3000],
     ['al-clipchars', 'clipChars', 500, 20000],
+    ['al-codethreshold', 'codeDeferChars', 1000, 200000],
+    ['al-codetotal', 'codeDeferTotalChars', 0, 500000],
+    ['al-chartokenthreshold', 'charTokenSkipChars', 5000, 200000],
     ['al-fps', 'fpsThreshold', 10, 60],
     ['al-long', 'longTaskMs', 50, 3000],
 ];
@@ -176,6 +186,20 @@ const state = {
     renderT0: 0,
     clipSig: '',
     clipDirty: true,
+    codeBlocks: new Map(),
+    codeMesKeys: new Map(),
+    codeSeq: 0,
+    codePending: null,
+    codeFormatterHooked: false,
+    codeRerenderPending: false,
+    codeScanDone: false,
+    charGuardTarget: null,
+    charGuardObserver: null,
+    charGuardInput: null,
+    charGuardTimer: 0,
+    codeClickTarget: null,
+    codeClickHandler: null,
+    codeKeyHandler: null,
 };
 
 /* ------------------------------------------------------------------ */
@@ -386,6 +410,16 @@ function rerenderChatSoon() {
     }, 400);
 }
 
+/** 代码块设置变化后的重渲染：生成中先记着，结束再补，避免流式时抢渲染 */
+function queueCodeRerender() {
+    if (state.generating || state.chatLoading) {
+        state.codeRerenderPending = true;
+        return;
+    }
+    state.codeRerenderPending = false;
+    rerenderChatSoon();
+}
+
 function restoreNativeLimit() {
     const pu = powerUser();
     if (!pu || !state.s || !state.s.truncApplied) return;
@@ -417,6 +451,11 @@ function loadSettings() {
     s.virtualizeMin = clamp(parseInt(s.virtualizeMin, 10) || DEFAULTS.virtualizeMin, 30, 500);
     s.trimKeep = clamp(parseInt(s.trimKeep, 10) || DEFAULTS.trimKeep, 10, 3000);
     s.clipChars = clamp(parseInt(s.clipChars, 10) || DEFAULTS.clipChars, 500, 20000);
+    s.codeDeferChars = clamp(parseInt(s.codeDeferChars, 10) || DEFAULTS.codeDeferChars, 1000, 200000);
+    s.codeDefer = s.codeDefer === undefined ? DEFAULTS.codeDefer : Boolean(s.codeDefer);
+    s.codeDeferTotalChars = s.codeDeferTotalChars === undefined ? DEFAULTS.codeDeferTotalChars : clamp(parseInt(s.codeDeferTotalChars, 10) || 0, 0, 500000);
+    s.charTokenSkipChars = clamp(parseInt(s.charTokenSkipChars, 10) || DEFAULTS.charTokenSkipChars, 5000, 200000);
+    s.charTokenSkip = s.charTokenSkip === undefined ? DEFAULTS.charTokenSkip : Boolean(s.charTokenSkip);
     s.fpsThreshold = clamp(parseInt(s.fpsThreshold, 10) || DEFAULTS.fpsThreshold, 10, 60);
     s.longTaskMs = clamp(parseInt(s.longTaskMs, 10) || DEFAULTS.longTaskMs, 50, 3000);
     s.streamFps = [0, 10, 15, 20].includes(Number(s.streamFps)) ? Number(s.streamFps) : 0;
@@ -834,6 +873,13 @@ function applyAll() {
         applyClip();
     }
 
+    syncCodeDefer();
+    if (isOn() && state.s.charTokenSkip) {
+        bindCharacterTokenGuard();
+        syncCharacterTokenGuard();
+    } else {
+        unbindCharacterTokenGuard();
+    }
     syncPanel();
     updateBadge();
 }
@@ -914,6 +960,397 @@ function applyImages() {
                 frame.dataset.alLoading = '1';
             }
         });
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 代码块按需渲染（角色卡/消息里的巨大代码是 ST 最贵的一类渲染）      */
+/* ------------------------------------------------------------------ */
+
+// 只处理闭合的围栏代码块：```lang\n...\n``` 或 ~~~lang\n...\n~~~
+// 在 AFTER_REGEX（Showdown 之前）就把超大代码换成短 token，避免每次流式 tick
+// 都让 Showdown + DOMPurify + highlight.js 重新啃一遍几十万字符。
+const FENCE_RE = /(^|\n)([ \t]{0,3})(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)\n[ \t]*\3[ \t]*(?=\n|$)/g;
+
+function escapeCodeHtml(text) {
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function formatCount(n) {
+    try { return Number(n || 0).toLocaleString('zh-CN'); } catch (err) { return String(n || 0); }
+}
+
+function codeLang(info) {
+    const first = String(info || '').trim().split(/\s+/)[0] || 'code';
+    return first.replace(/[^\w+#.-]/g, '').slice(0, 24) || 'code';
+}
+
+function pruneCodeMessage(mesId) {
+    const id = String(mesId);
+    const keys = state.codeMesKeys.get(id);
+    if (!keys) return;
+    keys.forEach((key) => state.codeBlocks.delete(key));
+    state.codeMesKeys.delete(id);
+}
+
+function buildCodePlaceholder(rec) {
+    const previewText = String(rec.code || '').replace(/\r/g, '').slice(0, 260);
+    const more = rec.code.length > previewText.length ? '…' : '';
+    return `<div class="al-code-defer" data-al-code="${rec.key}" data-al-code-len="${rec.chars}">`
+        + '<div class="al-code-head"><span class="al-code-title">代码块已延迟渲染</span>'
+        + `<span class="al-code-meta">${escapeCodeHtml(rec.lang)} · ${formatCount(rec.chars)} 字符</span>`
+        + '<span class="al-code-copy" role="button" tabindex="0" data-al-code-action="copy">复制</span>'
+        + '<span class="al-code-toggle" role="button" tabindex="0">点击渲染</span></div>'
+        + `<pre class="al-code-preview">${escapeCodeHtml(previewText)}${more}</pre>`
+        + '</div>';
+}
+
+function codePlaceholderElement(rec) {
+    const holder = document.createElement('div');
+    holder.innerHTML = buildCodePlaceholder(rec);
+    return holder.firstElementChild;
+}
+
+/** 把一段消息 markdown 里的超大围栏代码换成 token；token 在 AFTER_MARKDOWN 再换成占位块 */
+function encodeHugeCodeFences(mes, context) {
+    state.codePending = null;
+    if (state.disposed || !state.s || !state.s.enabled || !state.s.codeDefer || !isOn()) return mes;
+    const threshold = Number(state.s.codeDeferChars) || 8000;
+    const totalThreshold = Number(state.s.codeDeferTotalChars) || 0;
+    const mesId = context && Number.isFinite(Number(context.messageId)) ? Number(context.messageId) : 'x';
+
+    // 同一消息重新渲染时，旧代码记录已经没有 DOM 引用了，及时释放
+    pruneCodeMessage(mesId);
+    const keys = [];
+    state.codeMesKeys.set(String(mesId), keys);
+
+    const matches = [...mes.matchAll(FENCE_RE)];
+    let total = 0;
+    let max = 0;
+    for (const m of matches) {
+        const chars = m[5].length;
+        total += chars;
+        if (chars > max) max = chars;
+    }
+    // 整条消息代码总量过大时，即使每一块都不大，也全部按需渲染；否则只折叠单块超阈值的
+    const deferAll = totalThreshold > 0 && total >= totalThreshold;
+    if (!deferAll && max < threshold) return mes;
+
+    const nonce = Math.random().toString(36).slice(2, 8);
+    let index = 0;
+    let last = 0;
+    let output = '';
+    const tokens = new Map();
+    for (const m of matches) {
+        const body = m[5];
+        const chars = body.length;
+        if (!deferAll && chars < threshold) continue;
+        index++;
+        state.codeSeq++;
+        const key = `alc${state.codeSeq}`;
+        const token = `ALCD${nonce}${index}END`;
+        const rec = { key, code: body, lang: codeLang(m[4]), chars };
+        state.codeBlocks.set(key, rec);
+        keys.push(key);
+        tokens.set(token, rec);
+        output += mes.slice(last, m.index) + `${m[1]}${m[2]}\n${token}\n\n`;
+        last = m.index + m[0].length;
+    }
+    output += mes.slice(last);
+
+    if (tokens.size) state.codePending = { tokens };
+    return output;
+}
+
+/** AFTER_MARKDOWN：把 token 替换为只含标题和预览的占位块 */
+function replaceCodeTokens(html) {
+    const pending = state.codePending;
+    state.codePending = null;
+    if (!pending || !pending.tokens.size) return html;
+    let out = html;
+    for (const [token, rec] of pending.tokens) {
+        const block = buildCodePlaceholder(rec);
+        // Showdown 通常把独立 token 包成 <p>token</p>
+        out = out.replace(new RegExp(`<p>\\s*${token}\\s*</p>`, 'g'), block);
+        out = out.split(token).join(block);
+    }
+    return out;
+}
+
+function writeClipboardText(text) {
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+    } catch (err) { /* 落到 execCommand */ }
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+        return Promise.resolve();
+    } catch (err) {
+        return Promise.reject(err);
+    }
+}
+
+function expandDeferredCode(box) {
+    if (!box || !box.isConnected) return;
+    const rec = state.codeBlocks.get(box.dataset.alCode);
+    if (!rec) {
+        const title = box.querySelector('.al-code-title');
+        if (title) title.textContent = '代码缓存已释放，请重新渲染此消息';
+        return;
+    }
+    const wrap = document.createElement('div');
+    wrap.className = 'al-code-rendered-wrap';
+    wrap.dataset.alCode = rec.key;
+    const bar = document.createElement('div');
+    bar.className = 'al-code-bar';
+    const meta = document.createElement('span');
+    meta.className = 'al-code-meta';
+    meta.textContent = `${rec.lang} · ${formatCount(rec.chars)} 字符`;
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'al-code-action';
+    copy.dataset.alCodeAction = 'copy';
+    copy.textContent = '复制';
+    const collapse = document.createElement('button');
+    collapse.type = 'button';
+    collapse.className = 'al-code-action';
+    collapse.dataset.alCodeAction = 'collapse';
+    collapse.textContent = '收起';
+    bar.append(meta, copy, collapse);
+
+    const pre = document.createElement('pre');
+    pre.className = 'al-code-rendered';
+    const code = document.createElement('code');
+    // 直接 textContent，不把原始代码当 HTML 解析，也不触发 highlight.js
+    code.textContent = rec.code;
+    pre.appendChild(code);
+    wrap.append(bar, pre);
+    box.replaceWith(wrap);
+}
+
+function bindCodeDeferEvents() {
+    const chat = chatEl();
+    if (!chat) return;
+    if (state.codeClickHandler && state.codeClickTarget === chat) return;
+    if (state.codeClickHandler && state.codeClickTarget) {
+        state.codeClickTarget.removeEventListener('click', state.codeClickHandler);
+        state.codeClickTarget.removeEventListener('keydown', state.codeKeyHandler);
+    }
+    const click = (event) => {
+        const toggle = event.target.closest && event.target.closest('.al-code-toggle');
+        const box = toggle && toggle.closest('.al-code-defer');
+        if (box && chat.contains(box)) {
+            event.preventDefault();
+            expandDeferredCode(box);
+            return;
+        }
+        const action = event.target.closest && event.target.closest('[data-al-code-action]');
+        if (!action) return;
+        event.preventDefault();
+        const placeholder = action.closest('.al-code-defer');
+        if (placeholder) {
+            if (action.dataset.alCodeAction === 'copy') {
+                const rec = state.codeBlocks.get(placeholder.dataset.alCode);
+                if (rec) writeClipboardText(rec.code).then(() => {
+                    action.textContent = '已复制';
+                    setTimeout(() => { action.textContent = '复制'; }, 1200);
+                }).catch(() => { action.textContent = '复制失败'; });
+            }
+            return;
+        }
+        const wrap = action.closest('.al-code-rendered-wrap');
+        if (!wrap) return;
+        if (action.dataset.alCodeAction === 'collapse') {
+            const rec = state.codeBlocks.get(wrap.dataset.alCode);
+            if (rec) wrap.replaceWith(codePlaceholderElement(rec));
+            return;
+        }
+        if (action.dataset.alCodeAction === 'copy') {
+            const code = wrap.querySelector('code');
+            if (!code) return;
+            writeClipboardText(code.textContent || '').then(() => {
+                action.textContent = '已复制';
+                setTimeout(() => { action.textContent = '复制'; }, 1200);
+            }).catch(() => { action.textContent = '复制失败'; });
+        }
+    };
+    const keydown = (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        const toggle = event.target.closest && event.target.closest('.al-code-toggle');
+        const box = toggle && toggle.closest('.al-code-defer');
+        if (!box || !chat.contains(box)) return;
+        event.preventDefault();
+        expandDeferredCode(box);
+    };
+    state.codeClickHandler = click;
+    state.codeKeyHandler = keydown;
+    state.codeClickTarget = chat;
+    chat.addEventListener('click', click);
+    chat.addEventListener('keydown', keydown);
+}
+
+/** 兜底：把已经渲染出来的超长代码块换成占位（兼容旧版 ST / 刚装的当前聊天） */
+function convertRenderedHugeCode() {
+    if (!state.s || !isOn() || !state.s.codeDefer) return;
+    const threshold = Number(state.s.codeDeferChars) || 8000;
+    const totalThreshold = Number(state.s.codeDeferTotalChars) || 0;
+    const mesTexts = document.querySelectorAll('#chat .mes_text');
+    mesTexts.forEach((mesText) => {
+        const pres = Array.from(mesText.querySelectorAll('pre')).filter((pre) => {
+            if (pre.closest('.al-code-defer') || pre.classList.contains('al-code-restored')) return false;
+            return Boolean(pre.querySelector('code'));
+        });
+        if (!pres.length) return;
+        let total = 0;
+        for (const pre of pres) total += (pre.querySelector('code')?.textContent || '').length;
+        const convertAll = totalThreshold > 0 && total >= totalThreshold;
+        const mes = mesText.closest('.mes');
+        const mesId = mes && mes.dataset.mesid ? mes.dataset.mesid : 'x';
+        let keys = null;
+        for (const pre of pres) {
+            const code = pre.querySelector('code');
+            const raw = code.textContent || '';
+            if (!convertAll && raw.length < threshold) continue;
+            state.codeSeq++;
+            const key = `alc${state.codeSeq}`;
+            const langMatch = String(code.className || '').match(/language-([\w+#.-]+)/);
+            const rec = { key, code: raw, lang: codeLang(langMatch ? langMatch[1] : 'code'), chars: raw.length };
+            state.codeBlocks.set(key, rec);
+            if (!keys) {
+                keys = state.codeMesKeys.get(String(mesId));
+                if (!keys) {
+                    keys = [];
+                    state.codeMesKeys.set(String(mesId), keys);
+                }
+            }
+            keys.push(key);
+            pre.replaceWith(codePlaceholderElement(rec));
+        }
+    });
+}
+
+function restoreDeferredCode() {
+    const boxes = document.querySelectorAll('#chat .al-code-defer');
+    if (boxes.length) {
+        boxes.forEach((box) => {
+            const rec = state.codeBlocks.get(box.dataset.alCode);
+            if (!rec) return;
+            const pre = document.createElement('pre');
+            pre.className = 'al-code-restored';
+            const code = document.createElement('code');
+            code.textContent = rec.code;
+            pre.appendChild(code);
+            box.replaceWith(pre);
+        });
+    }
+    state.codeBlocks.clear();
+    state.codeMesKeys.clear();
+    state.codePending = null;
+}
+
+/* ------------------------------------------------------------------ */
+/* 角色卡字段 Token 统计降载                                           */
+/* ------------------------------------------------------------------ */
+
+const CHAR_TOKEN_FIELDS = new Set([
+    'character_name_pole', 'description_textarea', 'firstmessage_textarea',
+    'mes_example_textarea', 'personality_textarea', 'scenario_pole',
+    'system_prompt_textarea', 'post_history_instructions_textarea', 'depth_prompt_prompt',
+]);
+
+// ST 的 RA_CountCharTokens 会逐个 await getTokenCountAsync() 统计角色编辑器所有字段；
+// 简介/示例对话里塞几十万字符代码时，打开角色卡就会被分词拖住。这里只对超大字段跳过计数。
+function restoreCharTokenCounter(counter) {
+    if (!counter || counter.dataset.alTokenSkip !== '1') return;
+    const id = counter.dataset.alTokenCounter;
+    if (!id) return;
+    try {
+        if (window.jQuery) window.jQuery(counter).removeData('token-counter');
+    } catch (err) { /* 忽略 */ }
+    counter.dataset.tokenCounter = id;
+    delete counter.dataset.alTokenCounter;
+    delete counter.dataset.alTokenSkip;
+    counter.textContent = 'counting...';
+    counter.title = '';
+}
+
+function restoreCharTokenCounters() {
+    document.querySelectorAll('[data-al-token-skip="1"]').forEach(restoreCharTokenCounter);
+}
+
+function syncCharacterTokenGuard() {
+    const active = Boolean(state.s && isOn() && state.s.charTokenSkip);
+    const threshold = Number(state.s && state.s.charTokenSkipChars) || 20000;
+    document.querySelectorAll('[data-token-counter], [data-al-token-skip="1"]').forEach((counter) => {
+        if (!counter) return;
+        if (!active) { restoreCharTokenCounter(counter); return; }
+        const id = counter.dataset.tokenCounter || counter.dataset.alTokenCounter;
+        if (!id) return;
+        const input = document.getElementById(id);
+        if (!input || typeof input.value !== 'string') { restoreCharTokenCounter(counter); return; }
+        const len = input.value.length;
+        if (len < threshold) { restoreCharTokenCounter(counter); return; }
+        if (counter.dataset.tokenCounter) {
+            counter.dataset.alTokenCounter = counter.dataset.tokenCounter;
+            try {
+                if (window.jQuery) window.jQuery(counter).removeData('token-counter');
+            } catch (err) { /* 忽略 */ }
+            delete counter.dataset.tokenCounter;
+        }
+        counter.dataset.alTokenSkip = '1';
+        counter.textContent = `跳过 · ${formatCount(len)} 字`;
+        counter.title = 'AntiLag：超大字段跳过 token 统计，避免打开角色卡时被分词卡住';
+    });
+}
+
+function bindCharacterTokenGuard() {
+    if (state.charGuardInput) return;
+    const handler = (event) => {
+        const id = event && event.target && event.target.id;
+        if (!id || !CHAR_TOKEN_FIELDS.has(id)) return;
+        clearTimeout(state.charGuardTimer);
+        state.charGuardTimer = setTimeout(() => { syncCharacterTokenGuard(); }, 120);
+    };
+    state.charGuardInput = handler;
+    document.addEventListener('input', handler, true);
+    const tab = document.getElementById('rm_button_selected_ch');
+    if (tab && !state.charGuardObserver) {
+        state.charGuardObserver = new MutationObserver(() => {
+            // 选中角色变化会先改这个标题，ST 的 token 统计有 500ms 防抖，这里要抢在它前面
+            syncCharacterTokenGuard();
+        });
+        state.charGuardObserver.observe(tab, { childList: true, subtree: true });
+    }
+}
+
+function unbindCharacterTokenGuard() {
+    if (state.charGuardInput) document.removeEventListener('input', state.charGuardInput, true);
+    state.charGuardInput = null;
+    if (state.charGuardTimer) { clearTimeout(state.charGuardTimer); state.charGuardTimer = 0; }
+    try { state.charGuardObserver?.disconnect(); } catch (err) { /* 忽略 */ }
+    state.charGuardObserver = null;
+    restoreCharTokenCounters();
+}
+
+function syncCodeDefer() {
+    if (state.s && isOn() && state.s.codeDefer) {
+        bindCodeDeferEvents();
+        if (!state.codeScanDone && !isEditing()) {
+            state.codeScanDone = true;
+            withChatScroll(() => convertRenderedHugeCode());
+        }
+    } else {
+        withChatScroll(() => restoreDeferredCode());
     }
 }
 
@@ -1249,6 +1686,11 @@ function buildPanel() {
             <details class="al-fold">
                 <summary>历史与超长消息</summary>
                 ${rowToggle('al-trim', '折叠较早消息', '更早的消息移出渲染树，顶部可一键展开', 'trimHistory')}
+                ${rowToggle('al-codedefer', '代码块按需渲染', '超大代码块先显示标题，点击才生成代码 DOM；避免角色卡/消息里的巨大代码一次性 Markdown+高亮+布局', 'codeDefer')}
+                ${rowNumber('al-codethreshold', '代码块阈值', '单个代码块超过该字符数才延迟渲染；普通代码片段不受影响', s.codeDeferChars, '字', 1000, 200000)}
+                ${rowNumber('al-codetotal', '整条消息代码总量阈值', '一条消息里所有代码加起来超过该值，即使单块不大也全部按需渲染；0 表示只看单块阈值', s.codeDeferTotalChars, '字', 0, 500000)}
+                ${rowToggle('al-chartokenskip', '跳过超大角色字段 Token 统计', '角色卡简介/示例/首条消息含巨量代码时，ST 会逐个字段 await 分词；跳过超大字段可显著加快打开角色卡', 'charTokenSkip')}
+                ${rowNumber('al-chartokenthreshold', '角色字段阈值', '字段超过该字符数才跳过 Token 统计；只影响统计显示，不改角色卡内容', s.charTokenSkipChars, '字', 5000, 200000)}
                 ${rowNumber('al-keep', '折叠后保留', '保留最近多少条消息可见', s.trimKeep, '条', 10, 3000, 10)}
                 ${rowSelect('al-nativelimit', '借用 ST 原生分页', '把 ST 的「聊天截断」设为固定条数，改完立即重渲染；只影响显示、不影响上下文', s.nativeLimit, [
                     [0, '不改（用 ST 当前设置）'],
@@ -1309,6 +1751,10 @@ function bindPanel() {
             input.closest('.al-switch')?.classList.toggle('is-on', input.checked);
             save();
             applyAll();
+            if (key === 'codeDefer') {
+                state.codeScanDone = false;
+                if (input.checked) queueCodeRerender();
+            }
         });
     });
 
@@ -1316,11 +1762,15 @@ function bindPanel() {
         const input = el.querySelector('#' + id);
         if (!input) return;
         const commit = () => {
-            const val = clamp(parseInt(input.value, 10) || DEFAULTS[key], min, max);
+            const raw = parseInt(input.value, 10);
+            const val = key === 'codeDeferTotalChars'
+                ? clamp(Number.isFinite(raw) ? raw : DEFAULTS[key], min, max)
+                : clamp(raw || DEFAULTS[key], min, max);
             state.s[key] = val;
             input.value = String(val);
             save();
             applyAll();
+            if (key === 'codeDeferChars' || key === 'codeDeferTotalChars') queueCodeRerender();
         };
         input.addEventListener('change', commit);
         input.addEventListener('blur', commit);
@@ -1463,6 +1913,8 @@ function collectDiagnostics() {
 
     let blurCount = 0;
     let wcCount = 0;
+    let codeCount = 0;
+    let codeChars = 0;
     const hasBlur = (cs) => {
         const bf = cs.backdropFilter || cs.webkitBackdropFilter;
         if (bf && bf !== 'none') return true;
@@ -1484,6 +1936,16 @@ function collectDiagnostics() {
             const ccs = getComputedStyle(child);
             if (ccs.willChange && ccs.willChange !== 'auto') wcCount++;
         }
+        mes.querySelectorAll('.mes_text pre').forEach((pre) => {
+            codeCount++;
+            const deferred = pre.closest('.al-code-defer');
+            if (deferred) {
+                codeChars += Number(deferred.dataset.alCodeLen) || 0;
+            } else {
+                const code = pre.querySelector('code') || pre;
+                codeChars += (code.textContent || '').length;
+            }
+        });
     }
 
     let longest = 0;
@@ -1513,6 +1975,7 @@ function collectDiagnostics() {
 
     return {
         chatLen, mesDom, nodes, extCount, imgCount, blurCount, wcCount, longest, bgAnim,
+        codeCount, codeChars,
         nativeTrunc, stStreamFps, input,
         loadMs: state.chatLoadMs, loadCount: state.chatLoadCount, tps: state.tps,
         virtOn: document.body.classList.contains('antilag-virt'),
@@ -1560,6 +2023,7 @@ function renderDiagnostics() {
         ['will-change', String(d.wcCount), d.wcCount > 2 ? 'warn' : 'ok'],
         ['动画背景', d.bgAnim ? '存在' : '无', d.bgAnim ? 'warn' : 'ok'],
         ['近期最长消息', d.longest > 5000 ? `${Math.round(d.longest / 1000)}k 字` : `${d.longest} 字`, d.longest > 5000 ? 'warn' : 'ok'],
+        ['代码块（近30条）', `${d.codeCount} 个 / ${d.codeChars > 1000 ? `${Math.round(d.codeChars / 1000)}k` : d.codeChars} 字${s.codeDefer ? '（按需）' : ''}`, d.codeChars > 30000 && !s.codeDefer ? 'warn' : 'ok'],
         ['聊天图片', String(d.imgCount), 'ok'],
         ['已启用扩展', String(d.extCount), d.extCount > 10 ? 'warn' : 'ok'],
         ['重型扩展', d.heavy.length ? d.heavy.join(' / ') : '无', d.heavy.length >= 3 ? 'warn' : 'ok'],
@@ -1576,6 +2040,8 @@ function renderDiagnostics() {
     if (d.bgAnim && !s.killBgAnim) tips.push('检测到动画背景，建议停用动画背景');
     if (d.wcCount > 2 && !s.willChange) tips.push('主题在滥用 will-change，建议开启「清理 will-change」');
     if (d.longest > 5000 && !s.clipLong) tips.push(`最长一条消息约 ${Math.round(d.longest / 1000)}k 字，可开「超长消息折叠」`);
+    if (d.codeChars > 20000 && !s.codeDefer) tips.push(`近 30 条里代码约 ${Math.round(d.codeChars / 1000)}k 字，建议开「代码块按需渲染」，避免一次性 Markdown+高亮`);
+    if (d.codeChars > 20000 && s.codeDefer && s.codeDeferChars > 8000) tips.push('代码量很大：可把「代码块阈值」降到 3000–5000，让更多代码块按需渲染');
     if (fps && fps < s.fpsThreshold) tips.push('当前帧率偏低，可先切「均衡」，仍卡再切「极速」');
     if (lt.max > s.longTaskMs) tips.push(`存在 ${Math.round(lt.max)}ms 主线程长任务，多为大聊天渲染或重扩展造成`);
     if (state.lastGenLt > 3) tips.push('生成期间长任务偏多：多为长消息流式重绘，可开「生成时轻量渲染」');
@@ -1745,6 +2211,28 @@ function disableBoost() {
     toast('info', '帧率已恢复，已退出临时极速模式');
 }
 
+/** 注册 ST 的 MessageFormatter 钩子：在 Showdown 前截走超大代码，避免每次渲染都重啃 */
+function registerCodeFormatterHooks() {
+    if (state.codeFormatterHooked || state.disposed) return;
+    const c = ctx();
+    const mf = c && c.messageFormatter;
+    if (!mf || typeof mf.addHook !== 'function' || !mf.stage) return;
+    try {
+        mf.addHook(encodeHugeCodeFences, { stage: mf.stage.AFTER_REGEX, order: (mf.order && mf.order.LATE) || 90 });
+        mf.addHook(replaceCodeTokens, { stage: mf.stage.AFTER_MARKDOWN, order: (mf.order && mf.order.NORMAL) || 50 });
+        state.codeFormatterHooked = true;
+        console.log('[AntiLag] 代码块按需渲染钩子已注册');
+    } catch (err) {
+        console.warn('[AntiLag] 代码块格式化钩子注册失败', err);
+    }
+}
+
+function clearCodeStore() {
+    state.codeBlocks.clear();
+    state.codeMesKeys.clear();
+    state.codePending = null;
+}
+
 /* ------------------------------------------------------------------ */
 /* 事件与挂载                                                          */
 /* ------------------------------------------------------------------ */
@@ -1843,13 +2331,14 @@ function registerEvents() {
         state.mountTries = 0;
         // 初始化早期 getContext/powerUser 可能还没就绪，这里补一次应用
         applyAll();
+        registerCodeFormatterHooks();
         mountUi();
         observeChat();
         hookScrollIdle();
         registerEvents();
         startInputTiming();
     });
-    on('APP_INITIALIZED', () => { applyAll(); mountUi(); registerEvents(); });
+    on('APP_INITIALIZED', () => { applyAll(); registerCodeFormatterHooks(); mountUi(); registerEvents(); });
     on('CHAT_LOADED', () => {
         // 这个事件在 printMessages 之前触发：从这里开始计时，才能覆盖真正的解析+渲染
         state.chatLoading = true;
@@ -1877,7 +2366,13 @@ function registerEvents() {
         state.chatLoading = false;
         clearTimeout(state.chatLoadTimer);
         state.chatLoadTimer = 0;
+        state.codeScanDone = false;
+        clearCodeStore();
         applyAll();
+        if (state.codeRerenderPending && !state.generating && !state.chatLoading) {
+            state.codeRerenderPending = false;
+            rerenderChatSoon();
+        }
         hookScrollIdle();
         scheduleSweep();
         // 等两帧后才包含绘制完成；没有前置 CHAT_LOADED 的场景不记这个指标
@@ -1928,6 +2423,10 @@ function registerEvents() {
             state.nativeChanged = false;
             rerenderChatSoon();
         }
+        if (state.codeRerenderPending && !state.chatLoading) {
+            state.codeRerenderPending = false;
+            rerenderChatSoon();
+        }
         observeChat();
         scheduleSweep();
         if (panelVisible()) renderDiagnostics();
@@ -1945,6 +2444,7 @@ function init() {
         if (state.s.truncApplied) restoreNativeLimit();
         if (state.s.fadeApplied) restoreStreamFadeSkip();
         applyAll();
+        registerCodeFormatterHooks();
         // 保存过「借用 ST 原生分页」时，ST 首屏可能还按旧值渲染，补一次重渲染
         if (state.s.nativeLimit) rerenderChatSoon();
         mountUi();
@@ -1992,8 +2492,10 @@ export function onEnable() {
         return Promise.resolve();
     }
     state.s.enabled = true;
+    state.codeScanDone = false;
     save();
     applyAll();
+    registerCodeFormatterHooks();
     mountUi();
     observeChat();
     hookScrollIdle();
@@ -2008,7 +2510,16 @@ export function onEnable() {
 
 /** 生命周期钩子：更新/删除前清理残留（manifest.hooks.clean） */
 export function onCleanUp() {
+    try { unbindCharacterTokenGuard(); } catch (err) { /* 忽略 */ }
     state.disposed = true;
+    try { restoreDeferredCode(); } catch (err) { /* 忽略 */ }
+    if (state.codeClickTarget && state.codeClickHandler) {
+        try { state.codeClickTarget.removeEventListener('click', state.codeClickHandler); } catch (err) { /* 忽略 */ }
+        try { state.codeClickTarget.removeEventListener('keydown', state.codeKeyHandler); } catch (err) { /* 忽略 */ }
+    }
+    state.codeClickTarget = null;
+    state.codeClickHandler = null;
+    state.codeKeyHandler = null;
     try { restoreStreamFps(); } catch (err) { /* 忽略 */ }
     try { restoreNativeLimit(); } catch (err) { /* 忽略 */ }
     try { restoreStreamFadeSkip(); } catch (err) { /* 忽略 */ }
