@@ -8,5 +8,6 @@
   "css": "style.css",
   "author": "Doubao",
   "version": "1.0.0",
-  "auto_update": false
+  "auto_update": false,
+  "homePage": "https://github.com/Neohero521/SillyTavern-AntiLag"
 }
