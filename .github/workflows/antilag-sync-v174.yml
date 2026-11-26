@@ -1,0 +1,43 @@
+name: AntiLag v1.7.4 sync
+
+on:
+  push:
+    paths:
+      - '.github/workflows/antilag-sync-v174.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download v1.7.4 files from CDN
+        run: |
+          set -euo pipefail
+          CURL=(curl --http1.1 --connect-timeout 15 --max-time 90 --retry 3 --retry-all-errors -fsSL)
+          "${CURL[@]}" https://aka.doubaocdn.com/s/ObK5eqkufT -o index.js
+          "${CURL[@]}" https://aka.doubaocdn.com/s/uyqLFlUChq -o style.css
+          "${CURL[@]}" https://aka.doubaocdn.com/s/4ku5vPUYGU -o manifest.json
+          "${CURL[@]}" https://aka.doubaocdn.com/s/mwnnle7b1X -o README.md
+          "${CURL[@]}" https://aka.doubaocdn.com/s/NXUC5nUUoa -o antilag-1.7.4.zip
+
+      - name: Commit release files
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.js style.css manifest.json README.md antilag-1.7.4.zip
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "release: AntiLag v1.7.4 [skip ci]"
+            git push origin HEAD:main
+          fi
