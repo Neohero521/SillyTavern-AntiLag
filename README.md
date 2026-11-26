@@ -145,6 +145,18 @@ v1.7.8 对超大前端代码走“快速交接”：在 AFTER_REGEX 把代码截
 
 普通 JS/CSS/超长文本代码块仍走 AntiLag 虚拟直出；前端代码块不再变成 AntiLag 的加载中壳。
 
+## v1.8.0 做了什么：继续核对 release 1.19.1 的事件与渲染热点
+
+这一轮重新拉取 `release` 分支（`82b64a4`，1.19.1），逐段核对 `public/script.js`、`public/scripts/events.js`、`power-user.js` 后发现三处真实缺口：
+
+- **v1.7.9 的「生成时临时关闭平滑流式」没有真正接上**：`GENERATION_STARTED` 只调了 `applyStreamFadeSkip()`，漏了 `applySmoothStreamSkip()`。现在生成开始时会真正把 `power_user.smooth_streaming` 临时设为 false，结束后还原；同时补上 `targetStreamFps()`，确保流式降频在生成开始时生效。
+- **ST 1.19.1 新增/细分的渲染事件没有被消费**：`MESSAGE_FILE_EMBEDDED`、`MESSAGE_REASONING_EDITED`、`MESSAGE_REASONING_DELETED`、`TOOL_CALLS_RENDERED`、`IMAGE_SWIPED`、`CHARACTER_FIRST_MESSAGE_SELECTED` 都会往 `.mes_text` 写新 DOM，或者改变图片/首条消息。现在统一触发扫描与代码补水，避免这些路径留下未懒加载的图片、没补水的代码块或过期的裁剪签名。
+- **`auto_fix_generated_markdown` 每次渲染都跑 `fixMarkdown`**：`messageFormatting()` 在 `AFTER_REGEX` 后无条件执行 `fixMarkdown(mes, true)`，长消息越多成本越高。体检新增「自动修 Markdown」行，只报告、不改用户设置；需要时可在 ST 用户设置里关掉（代价是畸形 Markdown 不再自动修复）。
+
+这一轮没有改任何核心源码，也没有新增会常驻的扫描循环；新增事件都挂在现有的 `scheduleSweep` / `scheduleCodeHydration` 上，禁用扩展时统一摘除。
+
+---
+
 ## v1.7.9 做了什么：对齐 ST 1.19.1 的官方性能项
 
 这一轮重新核对 SillyTavern 官方 FAQ 与 release 1.19.1 源码（commit `82b64a4`）：
@@ -391,6 +403,7 @@ antilag/
 
 ## 版本
 
+- **v1.8.0**：继续核对 release 1.19.1 的 `events.js` / `script.js` / `power-user.js`——修复「生成时关闭平滑流式」漏调用；生成开始补 `targetStreamFps()`；接入 `MESSAGE_FILE_EMBEDDED`、`MESSAGE_REASONING_EDITED/DELETED`、`TOOL_CALLS_RENDERED`、`IMAGE_SWIPED`、`CHARACTER_FIRST_MESSAGE_SELECTED`；体检新增 `auto_fix_generated_markdown` 归因。
 - **v1.7.9**：对齐 ST 1.19.1 官方性能项——新增「生成时临时关闭平滑流式」（`smooth_streaming` 的逐分片人工延迟）、原生分页补 50/80 档、体检增加平滑流式/减少动画；只检测不改用户的 ST 外观设置。
 - **v1.7.8**：给超大前端代码加“快速交接”——在 Showdown 前截成 token，绕过 Markdown/HTML 解析，随后还原成原生 `<pre><code class="no-highlight">` 交给酒馆助手；hljs 直接跳过，酒馆助手仍能接管 iframe。普通大代码块继续虚拟直出。
 - **v1.7.7**：兼容 `JS-Slash-Runner`（酒馆助手）。含 `<html>`、`<head>`、`<body>` 的前端代码块**不再被 AntiLag 截走**，原样交给 Showdown 和酒馆助手，由它转成 iframe 渲染；只有普通大代码块才走虚拟直出。此前把前端代码截成 raw 代码壳，酒馆助手只认原生 `<pre><code>`，所以会一直停在“代码加载中”。

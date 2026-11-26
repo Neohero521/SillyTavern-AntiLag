@@ -1,5 +1,5 @@
 /**
- * AntiLag 流畅优化 v1.7.1 —— SillyTavern 扩展
+ * AntiLag 流畅优化 v1.8.0 —— SillyTavern 扩展
  *
  * 设计原则：
  * 1) 默认「轻度」模式视觉零改动，只做不改变观感的减负；
@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.9';
+const VERSION = '1.8.0';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -2280,12 +2280,13 @@ function collectDiagnostics() {
     const stStreamFps = Number(pu.streaming_fps) || 0;
     const smoothStreaming = Boolean(pu.smooth_streaming);
     const reducedMotion = Boolean(pu.reduced_motion);
+    const autoFix = Boolean(pu.auto_fix_generated_markdown);
     const input = recentInput();
 
     return {
         chatLen, mesDom, nodes, extCount, imgCount, blurCount, wcCount, longest, bgAnim,
         codeCount, codeChars,
-        nativeTrunc, stStreamFps, smoothStreaming, reducedMotion, input,
+        nativeTrunc, stStreamFps, smoothStreaming, reducedMotion, autoFix, input,
         loadMs: state.chatLoadMs, loadCount: state.chatLoadCount, tps: state.tps,
         virtOn: document.body.classList.contains('antilag-virt'),
         cvSize: state.cvSize,
@@ -2327,6 +2328,7 @@ function renderDiagnostics() {
         ['流式帧率', d.stStreamFps ? `${d.stStreamFps} FPS` : '未知', (d.stStreamFps >= 30 && state.lastGenLt > 3) ? 'warn' : 'ok'],
         ['流式淡入', d.fadeIn ? '开（每 tick 重建分段）' : '关', d.fadeIn ? 'warn' : 'ok'],
         ['平滑流式', d.smoothStreaming ? '开（逐字延时）' : '关', d.smoothStreaming ? 'warn' : 'ok'],
+        ['自动修 Markdown', d.autoFix ? '开（每次渲染跑 fixMarkdown）' : '关', d.autoFix ? 'warn' : 'ok'],
         ['减少动画', d.reducedMotion ? '开' : '关', d.reducedMotion ? 'ok' : 'ok'],
         ['ST 快速 UI', d.fastUi ? '开（全界面无模糊）' : '关', (!d.fastUi && d.blurCount > 0) ? 'warn' : 'ok'],
         ['正则脚本', String(d.regexCount), d.regexCount > 5 ? 'warn' : 'ok'],
@@ -2373,6 +2375,7 @@ function renderDiagnostics() {
     if (d.input.max > 100) tips.push(`输入延迟最大 ${Math.round(d.input.max)}ms：按键被主线程计算挡住（世界书扫描/正则/向量检索/tokenizer），不是输入框本身问题`);
     if (d.fadeIn && !s.streamFadeSkip) tips.push('「流式淡入」每个 tick 都要把整条消息按词重切 span 再 morphdom，长消息会明显卡；可开「生成时临时关闭流式淡入」或在 ST 里关掉');
     if (d.smoothStreaming && !s.smoothStreamSkip) tips.push('ST「平滑流式」会在每个流式分片之间插入人工延迟，长回复会更慢；可开「生成时临时关闭平滑流式」');
+    if (d.autoFix) tips.push('ST「自动修复生成的 Markdown」默认开，每次渲染整条消息都会跑 fixMarkdown；长消息多时可在用户设置里关掉，代价是畸形 Markdown 可能不再自动修复');
     if (!d.reducedMotion && !s.killTransitions) tips.push('ST 官方建议开启「减少动画」：用户设置 → 界面主题里勾选 Reduced motion，可去掉装饰性过渡与动画');
     if (!d.fastUi && d.blurCount > 0) tips.push('ST 自带「快速 UI 模式」能一键去掉全界面毛玻璃（比逐项关更彻底），在 ST 用户设置里开启即可');
     if (d.regexCount > 5) tips.push(`已启用 ${d.regexCount} 条正则脚本，每条消息渲染都要全跑一遍；不常用的先在「正则」扩展里停用`);
@@ -2714,6 +2717,13 @@ function registerEvents() {
     on('MESSAGE_UPDATED', () => { state.clipDirty = true; scheduleSweep(); scheduleCodeHydration(); });
     on('MESSAGE_SWIPED', () => { state.clipDirty = true; scheduleSweep(); scheduleCodeHydration(); });
     on('MESSAGE_DELETED', scheduleSweep);
+    // ST 1.19.1 新增/细分的渲染事件：工具调用、文件嵌入、推理编辑都会往 .mes_text 写新 DOM。
+    on('MESSAGE_FILE_EMBEDDED', () => { scheduleSweep(); scheduleCodeHydration(); });
+    on('MESSAGE_REASONING_EDITED', () => { state.clipDirty = true; scheduleSweep(); scheduleCodeHydration(); });
+    on('MESSAGE_REASONING_DELETED', () => { state.clipDirty = true; scheduleSweep(); scheduleCodeHydration(); });
+    on('IMAGE_SWIPED', scheduleSweep);
+    on('TOOL_CALLS_RENDERED', () => { scheduleSweep(); scheduleCodeHydration(); });
+    on('CHARACTER_FIRST_MESSAGE_SELECTED', () => scheduleCodeHydration());
     on('USER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); scheduleCodeHydration(); });
     on('CHARACTER_MESSAGE_RENDERED', () => { measureRender(); hotZoneTick(); scheduleSweep(); scheduleCodeHydration(); });
     on('MORE_MESSAGES_LOADED', () => { scheduleSweep(); scheduleMeasureCvSize(); scheduleCodeHydration(); });
@@ -2726,7 +2736,9 @@ function registerEvents() {
         pauseObserver();
         if (state.s && isOn() && state.s.genLite) document.body.classList.add('antilag-gen');
         else document.body.classList.remove('antilag-gen');
+        targetStreamFps();
         applyStreamFadeSkip();
+        applySmoothStreamSkip();
         applyHotZone();
     });
     const endGen = () => {
