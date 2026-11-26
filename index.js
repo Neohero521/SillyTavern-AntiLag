@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.1';
+const VERSION = '1.7.2';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -190,6 +190,10 @@ const state = {
     codeMesKeys: new Map(),
     codeSeq: 0,
     codePending: null,
+    codeViewHandlers: new Map(),
+    codeHighlightEntries: new Map(),
+    codeHydrateRaf: 0,
+    codeIO: null,
     codeFormatterHooked: false,
     codeRerenderPending: false,
     codeScanDone: false,
@@ -982,6 +986,244 @@ function formatCount(n) {
     try { return Number(n || 0).toLocaleString('zh-CN'); } catch (err) { return String(n || 0); }
 }
 
+/* ------------------------------------------------------------------ */
+/* 可见区语法着色（CSS Custom Highlight API）                          */
+/* ------------------------------------------------------------------ */
+// 不生成任何 <span>：完整代码始终是一个文本节点，只给“当前可见的几十行”
+// 建立 Range 并交给浏览器原生高亮。DOM 节点数不随代码长度增长，滚动时
+// 只重算可视窗口，因此几十万字符也不会把页面拖死。
+
+const CODE_KEYWORDS = new Set([
+    'abstract', 'as', 'async', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue',
+    'debugger', 'default', 'delete', 'do', 'else', 'enum', 'export', 'extends', 'finally', 'for',
+    'from', 'function', 'get', 'if', 'implements', 'import', 'in', 'instanceof', 'interface', 'let',
+    'new', 'of', 'package', 'private', 'protected', 'public', 'return', 'set', 'static', 'super',
+    'switch', 'this', 'throw', 'try', 'typeof', 'var', 'void', 'while', 'with', 'yield',
+    'def', 'elif', 'except', 'exec', 'global', 'lambda', 'nonlocal', 'pass', 'raise', 'print',
+    'and', 'or', 'not', 'is', 'assert', 'del', 'None', 'True', 'False',
+    'fn', 'impl', 'mut', 'pub', 'trait', 'use', 'where', 'match', 'loop', 'struct', 'crate',
+    'select', 'insert', 'update', 'create', 'table', 'drop', 'alter', 'join', 'where', 'group',
+    'order', 'limit', 'values', 'into', 'primary', 'key', 'foreign', 'references', 'index',
+]);
+const CODE_LITERALS = new Set(['true', 'false', 'null', 'undefined', 'None', 'True', 'False', 'nil', 'NaN', 'Infinity']);
+const CODE_TOKEN_RE = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\/\/[^\n]*|\/\*[\s\S]*?\*\/|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*\b)/g;
+
+function supportsCustomHighlight() {
+    return typeof window !== 'undefined'
+        && typeof window.Highlight === 'function'
+        && !!window.CSS && !!window.CSS.highlights;
+}
+
+function codeLineStarts(text) {
+    const starts = [0];
+    let at = text.indexOf('\n');
+    while (at !== -1) {
+        starts.push(at + 1);
+        at = text.indexOf('\n', at + 1);
+    }
+    return starts;
+}
+
+function codeTokenType(token, index, source) {
+    if (!token) return '';
+    if (token[0] === '"' || token[0] === '\'' || token[0] === '`') return 'string';
+    if (token.startsWith('//') || token.startsWith('/*')) return 'comment';
+    if (/^\d/.test(token)) return 'number';
+    if (!/^[A-Za-z_$]/.test(token)) return '';
+    if (CODE_LITERALS.has(token)) return 'literal';
+    if (CODE_KEYWORDS.has(token)) return 'keyword';
+    const prev = source[index - 1] || '';
+    if (prev === '.') return 'property';
+    const after = source.slice(index + token.length).match(/^\s*(.)/);
+    if (after && after[1] === '(') return 'title';
+    return '';
+}
+
+function codeTokenRanges(text, startOffset, endOffset) {
+    const source = text.slice(startOffset, endOffset);
+    const out = { keyword: [], string: [], comment: [], number: [], literal: [], title: [], property: [] };
+    CODE_TOKEN_RE.lastIndex = 0;
+    let m;
+    while ((m = CODE_TOKEN_RE.exec(source)) !== null) {
+        const token = m[0];
+        const type = codeTokenType(token, m.index, source);
+        if (!type) continue;
+        out[type].push([startOffset + m.index, startOffset + m.index + token.length]);
+        if (CODE_TOKEN_RE.lastIndex === m.index) CODE_TOKEN_RE.lastIndex++;
+    }
+    return out;
+}
+
+function clearCodeHighlights() {
+    if (!supportsCustomHighlight()) return;
+    ['keyword', 'string', 'comment', 'number', 'literal', 'title', 'property'].forEach((type) => {
+        window.CSS.highlights.delete(`al-code-${type}`);
+    });
+}
+
+function applyCodeHighlights() {
+    if (!supportsCustomHighlight()) return;
+    const combined = { keyword: [], string: [], comment: [], number: [], literal: [], title: [], property: [] };
+    for (const [pre, entry] of state.codeHighlightEntries) {
+        if (!pre || !pre.isConnected) {
+            state.codeHighlightEntries.delete(pre);
+            continue;
+        }
+        for (const type of Object.keys(combined)) {
+            if (entry[type] && entry[type].length) combined[type].push(...entry[type]);
+        }
+    }
+    for (const type of Object.keys(combined)) {
+        const ranges = combined[type];
+        if (!ranges.length) {
+            window.CSS.highlights.delete(`al-code-${type}`);
+            continue;
+        }
+        try {
+            window.CSS.highlights.set(`al-code-${type}`, new window.Highlight(...ranges));
+        } catch (err) { /* 某些浏览器对空/跨节点 range 比较挑，跳过 */ }
+    }
+}
+
+function refreshCodeHighlight(pre) {
+    if (!supportsCustomHighlight() || !pre || !pre.isConnected) return;
+    const text = pre.textContent || '';
+    if (!text) return;
+    const lineHeight = parseFloat(getComputedStyle(pre).lineHeight) || 20;
+    const viewH = pre.clientHeight || 0;
+    if (!viewH) return;
+    if (!pre.__alLineStarts || pre.__alText !== text) {
+        pre.__alText = text;
+        pre.__alLineStarts = codeLineStarts(text);
+    }
+    const starts = pre.__alLineStarts;
+    const firstLine = Math.max(0, Math.floor((pre.scrollTop || 0) / lineHeight) - 8);
+    // 最多着色 400 行：正常 62vh 窗口只有几十行，这里是防止主题把 max-height 改没后的兜底
+    const lastLine = Math.min(starts.length, firstLine + 400,
+        Math.ceil(((pre.scrollTop || 0) + viewH) / lineHeight) + 8);
+    const startOffset = starts[firstLine] || 0;
+    const endOffset = lastLine < starts.length ? starts[lastLine] : text.length;
+    const ranges = codeTokenRanges(text, startOffset, endOffset);
+    const nodes = [];
+    const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+    let node;
+    let offsetBase = 0;
+    while ((node = walker.nextNode())) {
+        const len = node.nodeValue ? node.nodeValue.length : 0;
+        nodes.push({ node, start: offsetBase, end: offsetBase + len });
+        offsetBase += len;
+    }
+    if (!nodes.length) return;
+    const mapped = {};
+    for (const type of Object.keys(ranges)) {
+        mapped[type] = [];
+        for (const [start, end] of ranges[type]) {
+            const from = nodes.find((n) => start >= n.start && start <= n.end);
+            const to = nodes.find((n) => end >= n.start && end <= n.end);
+            if (!from || !to || from.node !== to.node) continue;
+            try {
+                const range = document.createRange();
+                range.setStart(from.node, start - from.start);
+                range.setEnd(to.node, end - to.start);
+                mapped[type].push(range);
+            } catch (err) { /* 跳过 */ }
+        }
+    }
+    state.codeHighlightEntries.set(pre, mapped);
+    applyCodeHighlights();
+}
+
+function hydrateCodeView(pre) {
+    if (!pre || pre.dataset.alCodeHydrated === '1') return;
+    pre.dataset.alCodeHydrated = '1';
+    if (!pre.textContent) return;
+    pre.normalize();
+    if (!supportsCustomHighlight()) return;
+    if (state.codeViewHandlers.has(pre)) return;
+    let frame = 0;
+    const onScroll = () => {
+        if (frame) return;
+        frame = requestAnimationFrame(() => {
+            frame = 0;
+            refreshCodeHighlight(pre);
+        });
+    };
+    pre.addEventListener('scroll', onScroll, { passive: true });
+    state.codeViewHandlers.set(pre, onScroll);
+    // 首次布局完成后再计算可见行
+    requestAnimationFrame(() => refreshCodeHighlight(pre));
+}
+
+function cleanupCodeView(pre) {
+    if (!pre) return;
+    const handler = state.codeViewHandlers.get(pre);
+    if (handler) pre.removeEventListener('scroll', handler);
+    state.codeViewHandlers.delete(pre);
+    state.codeHighlightEntries.delete(pre);
+}
+
+function hydrateCodeViews() {
+    const chat = chatEl();
+    if (!chat) return;
+    const io = ensureCodeObserver();
+    chat.querySelectorAll('.al-code-full').forEach((block) => {
+        if (io && !block.__alIoObserved) {
+            block.__alIoObserved = true;
+            try { io.observe(block); } catch (err) { /* 忽略 */ }
+        }
+        if (block.dataset.alCodeReady === '1') return;
+        const pre = block.querySelector('.al-code-view');
+        if (!pre) return;
+        block.dataset.alCodeReady = '1';
+        hydrateCodeView(pre);
+    });
+    applyCodeHighlights();
+}
+
+function ensureCodeObserver() {
+    if (state.codeIO || typeof IntersectionObserver !== 'function') return state.codeIO;
+    state.codeIO = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+            if (!entry.isIntersecting) return;
+            const block = entry.target;
+            const pre = block.querySelector && block.querySelector('.al-code-view');
+            if (!pre) return;
+            requestAnimationFrame(() => refreshCodeHighlight(pre));
+        });
+    }, { rootMargin: '200px 0px' });
+    return state.codeIO;
+}
+
+function scheduleCodeHydration() {
+    if (state.codeHydrateRaf) return;
+    state.codeHydrateRaf = requestAnimationFrame(() => {
+        state.codeHydrateRaf = 0;
+        hydrateCodeViews();
+    });
+}
+
+function cleanupCodeViews() {
+    for (const pre of state.codeViewHandlers.keys()) cleanupCodeView(pre);
+    state.codeViewHandlers.clear();
+    state.codeHighlightEntries.clear();
+    clearCodeHighlights();
+    // 允许关闭后再打开时重新挂可视区着色；代码本身仍然完整保留
+    document.querySelectorAll('.al-code-full').forEach((block) => {
+        delete block.dataset.alCodeReady;
+        block.__alIoObserved = false;
+        const pre = block.querySelector('.al-code-view');
+        if (pre) delete pre.dataset.alCodeHydrated;
+    });
+    if (state.codeIO) {
+        try { state.codeIO.disconnect(); } catch (err) { /* 忽略 */ }
+        state.codeIO = null;
+    }
+    if (state.codeHydrateRaf) {
+        try { cancelAnimationFrame(state.codeHydrateRaf); } catch (err) { /* 忽略 */ }
+        state.codeHydrateRaf = 0;
+    }
+}
+
 function codeLang(info) {
     const first = String(info || '').trim().split(/\s+/)[0] || 'code';
     return first.replace(/[^\w+#.-]/g, '').slice(0, 24) || 'code';
@@ -996,13 +1238,14 @@ function pruneCodeMessage(mesId) {
 }
 
 function buildFullCodeBlock(rec) {
-    // 完整代码直接放进 <pre>（不再包 <code>），这样 ST 的 addCopyToCodeBlocks()
-    // 不会对这块再跑 hljs.highlightElement()；代码一个字符都不会少。
+    // 完整代码始终作为纯文本放进 pre（不包 <code>），所以 ST 的
+    // addCopyToCodeBlocks() 不会对它再跑 hljs.highlightElement()。
+    // 语法颜色由 CSS Custom Highlight API 只给“可视行”上色，不生成 span。
     return `<div class="al-code-full" data-al-code="${rec.key}" data-al-code-len="${rec.chars}">`
         + '<div class="al-code-head"><span class="al-code-title">代码块</span>'
         + `<span class="al-code-meta">${escapeCodeHtml(rec.lang)} · ${formatCount(rec.chars)} 字符</span>`
         + '<span class="al-code-copy" role="button" tabindex="0" data-al-code-action="copy">复制</span></div>'
-        + `<pre class="al-code-body" tabindex="0">${escapeCodeHtml(rec.code)}</pre>`
+        + `<pre class="al-code-view" data-al-code-view tabindex="0">${escapeCodeHtml(rec.code)}</pre>`
         + '</div>';
 }
 
@@ -1110,7 +1353,7 @@ function bindCodeDeferEvents() {
         const block = action.closest('.al-code-full');
         if (!block || !chat.contains(block)) return;
         const rec = state.codeBlocks.get(block.dataset.alCode);
-        const body = block.querySelector('.al-code-body');
+        const body = block.querySelector('.al-code-view');
         const text = rec ? rec.code : (body ? body.textContent || '' : '');
         writeClipboardText(text).then(() => {
             action.textContent = '已复制';
@@ -1175,6 +1418,7 @@ function convertRenderedHugeCode() {
             pre.replaceWith(fullCodeElement(rec));
         }
     });
+    hydrateCodeViews();
 }
 
 function restoreDeferredCode() {
@@ -1183,6 +1427,8 @@ function restoreDeferredCode() {
         boxes.forEach((box) => {
             const rec = state.codeBlocks.get(box.dataset.alCode);
             if (!rec) return;
+            const oldPre = box.querySelector('.al-code-view');
+            cleanupCodeView(oldPre);
             const pre = document.createElement('pre');
             pre.className = 'al-code-restored';
             const code = document.createElement('code');
@@ -1194,6 +1440,7 @@ function restoreDeferredCode() {
     state.codeBlocks.clear();
     state.codeMesKeys.clear();
     state.codePending = null;
+    cleanupCodeViews();
 }
 
 /* ------------------------------------------------------------------ */
@@ -2166,6 +2413,7 @@ function registerCodeFormatterHooks() {
 }
 
 function clearCodeStore() {
+    cleanupCodeViews();
     state.codeBlocks.clear();
     state.codeMesKeys.clear();
     state.codePending = null;
@@ -2307,6 +2555,7 @@ function registerEvents() {
         state.codeScanDone = false;
         clearCodeStore();
         applyAll();
+        scheduleCodeHydration();
         if (state.codeRerenderPending && !state.generating && !state.chatLoading) {
             state.codeRerenderPending = false;
             rerenderChatSoon();
@@ -2328,13 +2577,13 @@ function registerEvents() {
     });
     on('MESSAGE_RECEIVED', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
     on('MESSAGE_SENT', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
-    on('MESSAGE_EDITED', () => { state.clipDirty = true; scheduleSweep(); });
-    on('MESSAGE_UPDATED', () => { state.clipDirty = true; scheduleSweep(); });
-    on('MESSAGE_SWIPED', () => { state.clipDirty = true; scheduleSweep(); });
+    on('MESSAGE_EDITED', () => { state.clipDirty = true; scheduleSweep(); scheduleCodeHydration(); });
+    on('MESSAGE_UPDATED', () => { state.clipDirty = true; scheduleSweep(); scheduleCodeHydration(); });
+    on('MESSAGE_SWIPED', () => { state.clipDirty = true; scheduleSweep(); scheduleCodeHydration(); });
     on('MESSAGE_DELETED', scheduleSweep);
-    on('USER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); });
-    on('CHARACTER_MESSAGE_RENDERED', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
-    on('MORE_MESSAGES_LOADED', () => { scheduleSweep(); scheduleMeasureCvSize(); });
+    on('USER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); scheduleCodeHydration(); });
+    on('CHARACTER_MESSAGE_RENDERED', () => { measureRender(); hotZoneTick(); scheduleSweep(); scheduleCodeHydration(); });
+    on('MORE_MESSAGES_LOADED', () => { scheduleSweep(); scheduleMeasureCvSize(); scheduleCodeHydration(); });
     on('STREAM_TOKEN_RECEIVED', () => { state.tokens++; });
     on('GENERATION_STARTED', () => {
         state.generating = true;
@@ -2383,6 +2632,7 @@ function init() {
         if (state.s.fadeApplied) restoreStreamFadeSkip();
         applyAll();
         registerCodeFormatterHooks();
+        scheduleCodeHydration();
         // 保存过「借用 ST 原生分页」时，ST 首屏可能还按旧值渲染，补一次重渲染
         if (state.s.nativeLimit) rerenderChatSoon();
         mountUi();
