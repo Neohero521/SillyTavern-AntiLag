@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.5';
+const VERSION = '1.7.6';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -193,6 +193,7 @@ const state = {
     codeViewHandlers: new Map(),
     codeHydrateRaf: 0,
     codeHydrateTimer: 0,
+    codeSweepTimer: 0,
     codeIO: null,
     codeInsertObserver: null,
     codeInsertTarget: null,
@@ -1081,7 +1082,9 @@ function renderCodeWindow(pre) {
 }
 
 function hydrateCodeView(pre) {
-    if (!pre || pre.dataset.alCodeHydrated === '1') return;
+    if (!pre) return;
+    // 之前补水到一半失败，dataset 可能已经是 1，但 __alCodeState 没建立；允许重试
+    if (pre.dataset.alCodeHydrated === '1' && pre.__alCodeState) return;
     pre.dataset.alCodeHydrated = '1';
     const block = pre.closest && pre.closest('.al-code-full');
     const rec = block && state.codeBlocks.get(block.dataset.alCode);
@@ -1211,6 +1214,36 @@ function scheduleCodeHydrationFallback() {
     }, 150);
 }
 
+/** 最后一道保险：每秒扫一次仍停在“代码加载中”的块，直接强制补水；不依赖任何 ST 事件 */
+function retryStuckCodeBlocks() {
+    if (!state.s || !isOn() || !state.s.codeDefer) return;
+    document.querySelectorAll('.al-code-full').forEach((block) => {
+        const pre = block.querySelector && block.querySelector('.al-code-view');
+        if (!pre) return;
+        if (pre.__alCodeState && pre.querySelector('.al-code-line')) return;
+        if (!pre.textContent.includes('代码加载中')) return;
+        delete block.dataset.alCodeReady;
+        delete pre.dataset.alCodeHydrated;
+        try {
+            hydrateCodeView(pre);
+        } catch (err) {
+            console.error('[AntiLag] 代码块补水失败', err);
+            pre.textContent = '代码渲染失败，请刷新聊天';
+        }
+    });
+}
+
+function startCodeSweep() {
+    if (state.codeSweepTimer || !state.s || !isOn() || !state.s.codeDefer) return;
+    state.codeSweepTimer = setInterval(retryStuckCodeBlocks, 1000);
+}
+
+function stopCodeSweep() {
+    if (!state.codeSweepTimer) return;
+    try { clearInterval(state.codeSweepTimer); } catch (err) { /* 忽略 */ }
+    state.codeSweepTimer = 0;
+}
+
 function cleanupCodeViews() {
     for (const pre of state.codeViewHandlers.keys()) cleanupCodeView(pre);
     state.codeViewHandlers.clear();
@@ -1240,6 +1273,7 @@ function cleanupCodeViews() {
         try { clearTimeout(state.codeHydrateTimer); } catch (err) { /* 忽略 */ }
         state.codeHydrateTimer = 0;
     }
+    stopCodeSweep();
 }
 
 function codeLang(info) {
@@ -1261,9 +1295,9 @@ function buildFullCodeBlock(rec) {
     // 从 state.codeBlocks 取出完整代码，只填充可视窗口的行。
     return `<div class="al-code-full" data-al-code="${rec.key}" data-al-code-len="${rec.chars}">`
         + '<div class="al-code-head"><span class="al-code-title">代码块</span>'
-        + `<span class="al-code-meta">${escapeCodeHtml(rec.lang)} · ${formatCount(rec.chars)} 字符</span>`
+        + `<span class="al-code-meta">${escapeCodeHtml(rec.lang)} · ${formatCount(rec.chars)} 字符 · v${VERSION}</span>`
         + '<span class="al-code-copy" role="button" tabindex="0" data-al-code-action="copy">复制</span></div>'
-        + '<pre class="al-code-view" data-al-code-view tabindex="0"><span class="al-code-loading">代码加载中…</span></pre>'
+        + '<pre class="al-code-view" data-al-code-view tabindex="0"><span class="al-code-loading">代码加载中… v' + VERSION + '</span></pre>'
         + '</div>';
 }
 
@@ -1551,11 +1585,13 @@ function unbindCharacterTokenGuard() {
 function syncCodeDefer() {
     if (state.s && isOn() && state.s.codeDefer) {
         bindCodeDeferEvents();
+        startCodeSweep();
         if (!state.codeScanDone && !isEditing()) {
             state.codeScanDone = true;
             withChatScroll(() => convertRenderedHugeCode());
         }
     } else {
+        stopCodeSweep();
         withChatScroll(() => restoreDeferredCode());
     }
 }
