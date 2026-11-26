@@ -1,5 +1,5 @@
 /**
- * AntiLag 流畅优化 v1.7.0 —— SillyTavern 扩展
+ * AntiLag 流畅优化 v1.7.1 —— SillyTavern 扩展
  *
  * 设计原则：
  * 1) 默认「轻度」模式视觉零改动，只做不改变观感的减负；
@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.0';
+const VERSION = '1.7.1';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -964,7 +964,7 @@ function applyImages() {
 }
 
 /* ------------------------------------------------------------------ */
-/* 代码块按需渲染（角色卡/消息里的巨大代码是 ST 最贵的一类渲染）      */
+/* 超大代码完整直出（角色卡/消息里的巨大代码是 ST 最贵的一类渲染）    */
 /* ------------------------------------------------------------------ */
 
 // 只处理闭合的围栏代码块：```lang\n...\n``` 或 ~~~lang\n...\n~~~
@@ -972,12 +972,10 @@ function applyImages() {
 // 都让 Showdown + DOMPurify + highlight.js 重新啃一遍几十万字符。
 const FENCE_RE = /(^|\n)([ \t]{0,3})(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)\n[ \t]*\3[ \t]*(?=\n|$)/g;
 
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
 function escapeCodeHtml(text) {
-    return String(text)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+    // 一次扫描转义，避免对几十万字符做五遍 replace
+    return String(text).replace(/[&<>"]/g, (ch) => HTML_ESCAPES[ch]);
 }
 
 function formatCount(n) {
@@ -997,25 +995,24 @@ function pruneCodeMessage(mesId) {
     state.codeMesKeys.delete(id);
 }
 
-function buildCodePlaceholder(rec) {
-    const previewText = String(rec.code || '').replace(/\r/g, '').slice(0, 260);
-    const more = rec.code.length > previewText.length ? '…' : '';
-    return `<div class="al-code-defer" data-al-code="${rec.key}" data-al-code-len="${rec.chars}">`
-        + '<div class="al-code-head"><span class="al-code-title">代码块已延迟渲染</span>'
+function buildFullCodeBlock(rec) {
+    // 完整代码直接放进 <pre>（不再包 <code>），这样 ST 的 addCopyToCodeBlocks()
+    // 不会对这块再跑 hljs.highlightElement()；代码一个字符都不会少。
+    return `<div class="al-code-full" data-al-code="${rec.key}" data-al-code-len="${rec.chars}">`
+        + '<div class="al-code-head"><span class="al-code-title">代码块</span>'
         + `<span class="al-code-meta">${escapeCodeHtml(rec.lang)} · ${formatCount(rec.chars)} 字符</span>`
-        + '<span class="al-code-copy" role="button" tabindex="0" data-al-code-action="copy">复制</span>'
-        + '<span class="al-code-toggle" role="button" tabindex="0">点击渲染</span></div>'
-        + `<pre class="al-code-preview">${escapeCodeHtml(previewText)}${more}</pre>`
+        + '<span class="al-code-copy" role="button" tabindex="0" data-al-code-action="copy">复制</span></div>'
+        + `<pre class="al-code-body" tabindex="0">${escapeCodeHtml(rec.code)}</pre>`
         + '</div>';
 }
 
-function codePlaceholderElement(rec) {
+function fullCodeElement(rec) {
     const holder = document.createElement('div');
-    holder.innerHTML = buildCodePlaceholder(rec);
+    holder.innerHTML = buildFullCodeBlock(rec);
     return holder.firstElementChild;
 }
 
-/** 把一段消息 markdown 里的超大围栏代码换成 token；token 在 AFTER_MARKDOWN 再换成占位块 */
+/** 把一段消息 markdown 里的超大围栏代码换成 token；token 在 AFTER_MARKDOWN 再换成完整直出块 */
 function encodeHugeCodeFences(mes, context) {
     state.codePending = null;
     if (state.disposed || !state.s || !state.s.enabled || !state.s.codeDefer || !isOn()) return mes;
@@ -1036,7 +1033,7 @@ function encodeHugeCodeFences(mes, context) {
         total += chars;
         if (chars > max) max = chars;
     }
-    // 整条消息代码总量过大时，即使每一块都不大，也全部按需渲染；否则只折叠单块超阈值的
+    // 整条消息代码总量过大时，即使每一块都不大，也全部走快速直出；否则只处理单块超阈值的
     const deferAll = totalThreshold > 0 && total >= totalThreshold;
     if (!deferAll && max < threshold) return mes;
 
@@ -1066,14 +1063,14 @@ function encodeHugeCodeFences(mes, context) {
     return output;
 }
 
-/** AFTER_MARKDOWN：把 token 替换为只含标题和预览的占位块 */
+/** AFTER_MARKDOWN：把 token 替换为完整代码块（不省略任何字符，不交给 hljs） */
 function replaceCodeTokens(html) {
     const pending = state.codePending;
     state.codePending = null;
     if (!pending || !pending.tokens.size) return html;
     let out = html;
     for (const [token, rec] of pending.tokens) {
-        const block = buildCodePlaceholder(rec);
+        const block = buildFullCodeBlock(rec);
         // Showdown 通常把独立 token 包成 <p>token</p>
         out = out.replace(new RegExp(`<p>\\s*${token}\\s*</p>`, 'g'), block);
         out = out.split(token).join(block);
@@ -1100,44 +1097,6 @@ function writeClipboardText(text) {
     }
 }
 
-function expandDeferredCode(box) {
-    if (!box || !box.isConnected) return;
-    const rec = state.codeBlocks.get(box.dataset.alCode);
-    if (!rec) {
-        const title = box.querySelector('.al-code-title');
-        if (title) title.textContent = '代码缓存已释放，请重新渲染此消息';
-        return;
-    }
-    const wrap = document.createElement('div');
-    wrap.className = 'al-code-rendered-wrap';
-    wrap.dataset.alCode = rec.key;
-    const bar = document.createElement('div');
-    bar.className = 'al-code-bar';
-    const meta = document.createElement('span');
-    meta.className = 'al-code-meta';
-    meta.textContent = `${rec.lang} · ${formatCount(rec.chars)} 字符`;
-    const copy = document.createElement('button');
-    copy.type = 'button';
-    copy.className = 'al-code-action';
-    copy.dataset.alCodeAction = 'copy';
-    copy.textContent = '复制';
-    const collapse = document.createElement('button');
-    collapse.type = 'button';
-    collapse.className = 'al-code-action';
-    collapse.dataset.alCodeAction = 'collapse';
-    collapse.textContent = '收起';
-    bar.append(meta, copy, collapse);
-
-    const pre = document.createElement('pre');
-    pre.className = 'al-code-rendered';
-    const code = document.createElement('code');
-    // 直接 textContent，不把原始代码当 HTML 解析，也不触发 highlight.js
-    code.textContent = rec.code;
-    pre.appendChild(code);
-    wrap.append(bar, pre);
-    box.replaceWith(wrap);
-}
-
 function bindCodeDeferEvents() {
     const chat = chatEl();
     if (!chat) return;
@@ -1146,51 +1105,30 @@ function bindCodeDeferEvents() {
         state.codeClickTarget.removeEventListener('click', state.codeClickHandler);
         state.codeClickTarget.removeEventListener('keydown', state.codeKeyHandler);
     }
+    const copyBlock = (action) => {
+        if (!action) return;
+        const block = action.closest('.al-code-full');
+        if (!block || !chat.contains(block)) return;
+        const rec = state.codeBlocks.get(block.dataset.alCode);
+        const body = block.querySelector('.al-code-body');
+        const text = rec ? rec.code : (body ? body.textContent || '' : '');
+        writeClipboardText(text).then(() => {
+            action.textContent = '已复制';
+            setTimeout(() => { action.textContent = '复制'; }, 1200);
+        }).catch(() => { action.textContent = '复制失败'; });
+    };
     const click = (event) => {
-        const toggle = event.target.closest && event.target.closest('.al-code-toggle');
-        const box = toggle && toggle.closest('.al-code-defer');
-        if (box && chat.contains(box)) {
-            event.preventDefault();
-            expandDeferredCode(box);
-            return;
-        }
-        const action = event.target.closest && event.target.closest('[data-al-code-action]');
+        const action = event.target.closest && event.target.closest('[data-al-code-action="copy"]');
         if (!action) return;
         event.preventDefault();
-        const placeholder = action.closest('.al-code-defer');
-        if (placeholder) {
-            if (action.dataset.alCodeAction === 'copy') {
-                const rec = state.codeBlocks.get(placeholder.dataset.alCode);
-                if (rec) writeClipboardText(rec.code).then(() => {
-                    action.textContent = '已复制';
-                    setTimeout(() => { action.textContent = '复制'; }, 1200);
-                }).catch(() => { action.textContent = '复制失败'; });
-            }
-            return;
-        }
-        const wrap = action.closest('.al-code-rendered-wrap');
-        if (!wrap) return;
-        if (action.dataset.alCodeAction === 'collapse') {
-            const rec = state.codeBlocks.get(wrap.dataset.alCode);
-            if (rec) wrap.replaceWith(codePlaceholderElement(rec));
-            return;
-        }
-        if (action.dataset.alCodeAction === 'copy') {
-            const code = wrap.querySelector('code');
-            if (!code) return;
-            writeClipboardText(code.textContent || '').then(() => {
-                action.textContent = '已复制';
-                setTimeout(() => { action.textContent = '复制'; }, 1200);
-            }).catch(() => { action.textContent = '复制失败'; });
-        }
+        copyBlock(action);
     };
     const keydown = (event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
-        const toggle = event.target.closest && event.target.closest('.al-code-toggle');
-        const box = toggle && toggle.closest('.al-code-defer');
-        if (!box || !chat.contains(box)) return;
+        const action = event.target.closest && event.target.closest('[data-al-code-action="copy"]');
+        if (!action) return;
         event.preventDefault();
-        expandDeferredCode(box);
+        copyBlock(action);
     };
     state.codeClickHandler = click;
     state.codeKeyHandler = keydown;
@@ -1199,7 +1137,7 @@ function bindCodeDeferEvents() {
     chat.addEventListener('keydown', keydown);
 }
 
-/** 兜底：把已经渲染出来的超长代码块换成占位（兼容旧版 ST / 刚装的当前聊天） */
+/** 兜底：把已经渲染出来的超长代码块换成完整直出块（兼容刚装的当前聊天） */
 function convertRenderedHugeCode() {
     if (!state.s || !isOn() || !state.s.codeDefer) return;
     const threshold = Number(state.s.codeDeferChars) || 8000;
@@ -1207,7 +1145,7 @@ function convertRenderedHugeCode() {
     const mesTexts = document.querySelectorAll('#chat .mes_text');
     mesTexts.forEach((mesText) => {
         const pres = Array.from(mesText.querySelectorAll('pre')).filter((pre) => {
-            if (pre.closest('.al-code-defer') || pre.classList.contains('al-code-restored')) return false;
+            if (pre.closest('.al-code-full') || pre.closest('.al-code-defer') || pre.classList.contains('al-code-restored')) return false;
             return Boolean(pre.querySelector('code'));
         });
         if (!pres.length) return;
@@ -1234,13 +1172,13 @@ function convertRenderedHugeCode() {
                 }
             }
             keys.push(key);
-            pre.replaceWith(codePlaceholderElement(rec));
+            pre.replaceWith(fullCodeElement(rec));
         }
     });
 }
 
 function restoreDeferredCode() {
-    const boxes = document.querySelectorAll('#chat .al-code-defer');
+    const boxes = document.querySelectorAll('#chat .al-code-full, #chat .al-code-defer');
     if (boxes.length) {
         boxes.forEach((box) => {
             const rec = state.codeBlocks.get(box.dataset.alCode);
@@ -1686,9 +1624,9 @@ function buildPanel() {
             <details class="al-fold">
                 <summary>历史与超长消息</summary>
                 ${rowToggle('al-trim', '折叠较早消息', '更早的消息移出渲染树，顶部可一键展开', 'trimHistory')}
-                ${rowToggle('al-codedefer', '代码块按需渲染', '超大代码块先显示标题，点击才生成代码 DOM；避免角色卡/消息里的巨大代码一次性 Markdown+高亮+布局', 'codeDefer')}
-                ${rowNumber('al-codethreshold', '代码块阈值', '单个代码块超过该字符数才延迟渲染；普通代码片段不受影响', s.codeDeferChars, '字', 1000, 200000)}
-                ${rowNumber('al-codetotal', '整条消息代码总量阈值', '一条消息里所有代码加起来超过该值，即使单块不大也全部按需渲染；0 表示只看单块阈值', s.codeDeferTotalChars, '字', 0, 500000)}
+                ${rowToggle('al-codedefer', '超大代码完整直出', '代码一个字都不少，但绕过 Showdown 解析和 hljs 高亮；普通小代码块仍走 ST 原生渲染', 'codeDefer')}
+                ${rowNumber('al-codethreshold', '单块直出阈值', '单个代码块超过该字符数就走完整直出；低于阈值仍由 ST 原生解析并高亮', s.codeDeferChars, '字', 1000, 200000)}
+                ${rowNumber('al-codetotal', '单条消息代码总量阈值', '一条消息里所有代码加起来超过该值，即使单块不大也全部走完整直出；0 表示只看单块阈值', s.codeDeferTotalChars, '字', 0, 500000)}
                 ${rowToggle('al-chartokenskip', '跳过超大角色字段 Token 统计', '角色卡简介/示例/首条消息含巨量代码时，ST 会逐个字段 await 分词；跳过超大字段可显著加快打开角色卡', 'charTokenSkip')}
                 ${rowNumber('al-chartokenthreshold', '角色字段阈值', '字段超过该字符数才跳过 Token 统计；只影响统计显示，不改角色卡内容', s.charTokenSkipChars, '字', 5000, 200000)}
                 ${rowNumber('al-keep', '折叠后保留', '保留最近多少条消息可见', s.trimKeep, '条', 10, 3000, 10)}
@@ -1938,7 +1876,7 @@ function collectDiagnostics() {
         }
         mes.querySelectorAll('.mes_text pre').forEach((pre) => {
             codeCount++;
-            const deferred = pre.closest('.al-code-defer');
+            const deferred = pre.closest('.al-code-full') || pre.closest('.al-code-defer');
             if (deferred) {
                 codeChars += Number(deferred.dataset.alCodeLen) || 0;
             } else {
@@ -2040,8 +1978,8 @@ function renderDiagnostics() {
     if (d.bgAnim && !s.killBgAnim) tips.push('检测到动画背景，建议停用动画背景');
     if (d.wcCount > 2 && !s.willChange) tips.push('主题在滥用 will-change，建议开启「清理 will-change」');
     if (d.longest > 5000 && !s.clipLong) tips.push(`最长一条消息约 ${Math.round(d.longest / 1000)}k 字，可开「超长消息折叠」`);
-    if (d.codeChars > 20000 && !s.codeDefer) tips.push(`近 30 条里代码约 ${Math.round(d.codeChars / 1000)}k 字，建议开「代码块按需渲染」，避免一次性 Markdown+高亮`);
-    if (d.codeChars > 20000 && s.codeDefer && s.codeDeferChars > 8000) tips.push('代码量很大：可把「代码块阈值」降到 3000–5000，让更多代码块按需渲染');
+    if (d.codeChars > 20000 && !s.codeDefer) tips.push(`近 30 条里代码约 ${Math.round(d.codeChars / 1000)}k 字，建议开「超大代码完整直出」，避免一次性 Markdown+高亮`);
+    if (d.codeChars > 20000 && s.codeDefer && s.codeDeferChars > 8000) tips.push('代码量很大：可把「单块直出阈值」降到 3000–5000，让更多代码走完整直出');
     if (fps && fps < s.fpsThreshold) tips.push('当前帧率偏低，可先切「均衡」，仍卡再切「极速」');
     if (lt.max > s.longTaskMs) tips.push(`存在 ${Math.round(lt.max)}ms 主线程长任务，多为大聊天渲染或重扩展造成`);
     if (state.lastGenLt > 3) tips.push('生成期间长任务偏多：多为长消息流式重绘，可开「生成时轻量渲染」');
@@ -2221,7 +2159,7 @@ function registerCodeFormatterHooks() {
         mf.addHook(encodeHugeCodeFences, { stage: mf.stage.AFTER_REGEX, order: (mf.order && mf.order.LATE) || 90 });
         mf.addHook(replaceCodeTokens, { stage: mf.stage.AFTER_MARKDOWN, order: (mf.order && mf.order.NORMAL) || 50 });
         state.codeFormatterHooked = true;
-        console.log('[AntiLag] 代码块按需渲染钩子已注册');
+        console.log('[AntiLag] 超大代码完整直出钩子已注册');
     } catch (err) {
         console.warn('[AntiLag] 代码块格式化钩子注册失败', err);
     }
