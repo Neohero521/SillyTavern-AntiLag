@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.7';
+const VERSION = '1.7.8';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -1281,8 +1281,8 @@ function codeLang(info) {
     return first.replace(/[^\w+#.-]/g, '').slice(0, 24) || 'code';
 }
 
-/** 酒馆助手(JS-Slash-Runner)会把 <html>/<head>/<body> 的前端代码块接管成 iframe；
- *  这类块不能提前替换成 raw 代码壳，否则酒馆助手只认原生 <pre><code>，会直接不渲染。
+/** 酒馆助手(JS-Slash-Runner)会把包含 <html>/<head>/<body> 的前端代码块接管成 iframe。
+ *  v1.7.8 先 token 化绕过 Showdown，afterMarkdown 再还原成原生 <pre><code>；不能留成虚拟空壳。
  */
 function isFrontendCode(code) {
     const text = String(code == null ? '' : code);
@@ -1309,6 +1309,14 @@ function buildFullCodeBlock(rec) {
         + '</div>';
 }
 
+/** 前端代码快通道：不在 AntiLag 里画虚拟行，而是直接生成原生 <pre><code>。
+ *  这样绕过 Showdown/encode_tags 对 2M+ HTML 的解析，又让酒馆助手能照常接管 iframe。
+ */
+function buildFrontendCodeBlock(rec) {
+    // no-highlight 让 ST 的 hljs 直接跳过 2M+ 前端代码；酒馆助手会从 code.text() 读走原文
+    return `<pre class="al-fe-native"><code class="no-highlight">${escapeCodeHtml(rec.code)}</code></pre>`;
+}
+
 function fullCodeElement(rec) {
     const holder = document.createElement('div');
     holder.innerHTML = buildFullCodeBlock(rec);
@@ -1332,7 +1340,6 @@ function encodeHugeCodeFences(mes, context) {
     let total = 0;
     let max = 0;
     for (const m of matches) {
-        if (isFrontendCode(m[5])) continue;
         const chars = m[5].length;
         total += chars;
         if (chars > max) max = chars;
@@ -1349,14 +1356,12 @@ function encodeHugeCodeFences(mes, context) {
     for (const m of matches) {
         const body = m[5];
         const chars = body.length;
-        // 前端代码交给酒馆助手渲染 iframe；这里截走会让它只剩一个空代码块
-        if (isFrontendCode(body)) continue;
         if (!deferAll && chars < threshold) continue;
         index++;
         state.codeSeq++;
         const key = `alc${state.codeSeq}`;
         const token = `ALCD${nonce}${index}END`;
-        const rec = { key, code: body, lang: codeLang(m[4]), chars };
+        const rec = { key, code: body, lang: codeLang(m[4]), chars, frontend: isFrontendCode(body) };
         state.codeBlocks.set(key, rec);
         keys.push(key);
         tokens.set(token, rec);
@@ -1376,9 +1381,10 @@ function replaceCodeTokens(html) {
     if (!pending || !pending.tokens.size) return html;
     let out = html;
     for (const [token, rec] of pending.tokens) {
-        const block = buildFullCodeBlock(rec);
-        // Showdown 通常把独立 token 包成 <p>token</p>
-        out = out.replace(new RegExp(`<p>\\s*${token}\\s*</p>`, 'g'), block);
+        const block = rec.frontend ? buildFrontendCodeBlock(rec) : buildFullCodeBlock(rec);
+        if (rec.frontend) state.codeBlocks.delete(rec.key); // 前端已还原成原生代码，不再需要内存记录
+        // Showdown 通常把独立 token 包成 <p>token</p>；用函数替换避免代码里的 $& 被当成替换模式
+        out = out.replace(new RegExp(`<p>\\s*${token}\\s*</p>`, 'g'), () => block);
         out = out.split(token).join(block);
     }
     // 这一钩子返回后 ST 才把 HTML 写进 .mes_text；下一帧再补水，确保空壳已经在 DOM 里
