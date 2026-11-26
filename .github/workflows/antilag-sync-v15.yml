@@ -1,0 +1,25 @@
+name: antilag sync v1.5.0
+on:
+  push:
+    paths:
+      - '.github/workflows/antilag-sync-v15.yml'
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch files from cdn
+        run: |
+          curl -fsSL 'https://aka.doubaocdn.com/s/RvbE2PML97' -o index.js
+          curl -fsSL 'https://aka.doubaocdn.com/s/zAxSLQfRei' -o manifest.json
+          curl -fsSL 'https://aka.doubaocdn.com/s/l9wieRPFxQ' -o README.md
+          ls -l index.js manifest.json README.md
+      - name: commit and push
+        run: |
+          git config user.name 'Antilag Sync'
+          git config user.email 'actions@users.noreply.github.com'
+          git add index.js manifest.json README.md
+          git commit -m 'chore: sync v1.5.0 files' || echo 'no changes'
+          git push
