@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -57,6 +57,9 @@ const DEFAULTS = {
 
     trimHistory: false,
     trimKeep: 100,
+    nativeLimit: 0,
+    truncApplied: false,
+    truncOrig: 0,
     clipLong: false,
     clipChars: 3000,
 
@@ -100,6 +103,7 @@ const TOGGLES = [
 
 const SELECTS = [
     ['al-streamfps', 'streamFps'],
+    ['al-nativelimit', 'nativeLimit'],
 ];
 
 const NUMBERS = [
@@ -153,6 +157,8 @@ const state = {
     tps: 0,
     lastTps: 0,
     eventsBound: false,
+    lastRenderMs: 0,
+    renderT0: 0,
 };
 
 /* ------------------------------------------------------------------ */
@@ -271,6 +277,45 @@ function nativeTruncation() {
     return Number.isFinite(v) && v > 0 ? v : 0;
 }
 
+/** 当前是否处在 ST 原生分页状态（有「Show more messages」按钮） */
+function nativePagingActive() {
+    return Boolean(document.getElementById('show_more_messages'));
+}
+
+/**
+ * 可选：直接把 ST 的 chat_truncation 设成固定条数。
+ * 这是 ST 原生机制（只影响渲染，不影响 prompt 上下文），比本扩展自己折叠更稳，
+ * 也不会有两套历史机制打架的问题。记录原值，停用/恢复默认时还原。
+ */
+function applyNativeLimit() {
+    const pu = powerUser();
+    if (!pu || typeof pu.chat_truncation !== 'number') return 0;
+    const want = Number(state.s && state.s.nativeLimit) || 0;
+    if (!isOn() || !want) {
+        restoreNativeLimit();
+        return 0;
+    }
+    if (!state.s.truncApplied) {
+        state.s.truncOrig = pu.chat_truncation;
+        state.s.truncApplied = true;
+        save();
+    }
+    if (pu.chat_truncation !== want) pu.chat_truncation = want;
+    return want;
+}
+
+function restoreNativeLimit() {
+    const pu = powerUser();
+    if (!pu || !state.s || !state.s.truncApplied) return;
+    const applied = Number(state.s.nativeLimit) || 0;
+    // 只在「当前值仍是我们改的那个」时才还原，用户在 ST 里自己改过就尊重用户
+    if (applied && Number(pu.chat_truncation) === applied) {
+        pu.chat_truncation = Number(state.s.truncOrig) || 0;
+    }
+    state.s.truncApplied = false;
+    save();
+}
+
 /* ------------------------------------------------------------------ */
 /* 设置                                                                */
 /* ------------------------------------------------------------------ */
@@ -288,6 +333,9 @@ function loadSettings() {
     s.longTaskMs = clamp(parseInt(s.longTaskMs, 10) || DEFAULTS.longTaskMs, 50, 3000);
     s.streamFps = [0, 10, 15, 20].includes(Number(s.streamFps)) ? Number(s.streamFps) : 0;
     s.streamFpsOrig = clamp(parseInt(s.streamFpsOrig, 10) || 0, 0, 240);
+    s.nativeLimit = [0, 100, 150, 300].includes(Number(s.nativeLimit)) ? Number(s.nativeLimit) : 0;
+    s.truncOrig = clamp(parseInt(s.truncOrig, 10) || 0, 0, 5000);
+    s.truncApplied = Boolean(s.truncApplied);
     if (!PRESETS[s.mode] && s.mode !== 'custom') s.mode = DEFAULTS.mode;
 
     // 过期暂停自动清除
@@ -437,7 +485,8 @@ function refreshVirtGate() {
     const mes = countMessages();
     state.mesCount = mes;
     state.nativeTrunc = nativeTruncation();
-    const virt = on && eff('virtualize') && mes >= state.s.virtualizeMin;
+    // 原生分页开着时不做虚拟化：ST 每次「Show more」都会前插并补偿滚动，content-visibility 会把高度估歪
+    const virt = on && eff('virtualize') && !nativePagingActive() && mes >= state.s.virtualizeMin;
     if (document.body.classList.contains('antilag-virt') === virt) {
         applyHotZone();
         return;
@@ -590,6 +639,17 @@ function recentInput() {
     return { count: state.inputEvents.length, max };
 }
 
+/** 量一条消息从「消息落地事件」到「稳定一帧」的耗时（含其它扩展的收尾处理） */
+function measureRender() {
+    if (state.renderT0) return;
+    state.renderT0 = performance.now();
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (!state.renderT0) return;
+        state.lastRenderMs = performance.now() - state.renderT0;
+        state.renderT0 = 0;
+    }));
+}
+
 /* ------------------------------------------------------------------ */
 /* 应用与撤销                                                          */
 /* ------------------------------------------------------------------ */
@@ -602,7 +662,8 @@ function applyAll() {
     const mes = countMessages();
     state.mesCount = mes;
     state.nativeTrunc = nativeTruncation();
-    const virt = on && eff('virtualize') && mes >= state.s.virtualizeMin;
+    // 原生分页开着时不做虚拟化：ST 每次「Show more」都会前插并补偿滚动，content-visibility 会把高度估歪
+    const virt = on && eff('virtualize') && !nativePagingActive() && mes >= state.s.virtualizeMin;
     const wasVirt = document.body.classList.contains('antilag-virt');
 
     document.documentElement.classList.toggle('antilag', on);
@@ -617,8 +678,13 @@ function applyAll() {
     swapStyle(on ? buildCss() : '');
     applyHotZone();
     if (virt && (!wasVirt || !state.cvSize)) scheduleMeasureCvSize();
-    if (on) targetStreamFps();
-    else restoreStreamFps();
+    if (on) {
+        targetStreamFps();
+        applyNativeLimit();
+    } else {
+        restoreStreamFps();
+        restoreNativeLimit();
+    }
     if (!on) {
         clearStructural();
     } else {
@@ -653,14 +719,15 @@ function clearStructural() {
 
 function applyImages() {
     if (!eff('lazyImg')) return;
-    document.querySelectorAll('#chat img:not([data-al-lazy])').forEach((img) => {
+    // 只处理消息正文里的图（含媒体块）：头像同 URL 且尺寸小，懒加载反而会在滚动时闪加载
+    document.querySelectorAll('#chat .mes_block img:not([data-al-lazy])').forEach((img) => {
         img.dataset.alLazy = '1';
         if (!img.hasAttribute('loading')) img.setAttribute('loading', 'lazy');
         if (!img.hasAttribute('decoding')) img.setAttribute('decoding', 'async');
         img.classList.add('al-lazy');
     });
     if (eff('lazyFrame')) {
-        document.querySelectorAll('#chat iframe:not([data-al-lazy])').forEach((frame) => {
+        document.querySelectorAll('#chat .mes_block iframe:not([data-al-lazy])').forEach((frame) => {
             frame.dataset.alLazy = '1';
             frame.setAttribute('loading', 'lazy');
         });
@@ -771,19 +838,34 @@ function applyClip() {
     });
 }
 
-const scheduleSweep = debounce(() => {
-    if (document.hidden || !state.s) return;
-    if (state.generating) return; // 生成中不打扰
-    try {
-        refreshVirtGate();
-        applyImages();
-        applyTrim();
-        applyClip();
-        updateBadge();
-    } catch (err) {
-        console.warn('[AntiLag] 扫描失败', err);
-    }
-}, 420);
+const scheduleSweep = (() => {
+    let timer = 0;
+    const run = () => {
+        if (document.hidden || !state.s) return;
+        if (state.generating) return; // 生成中不打扰
+        try {
+            refreshVirtGate();
+            applyImages();
+            applyTrim();
+            applyClip();
+            updateBadge();
+        } catch (err) {
+            console.warn('[AntiLag] 扫描失败', err);
+        }
+    };
+    return () => {
+        clearTimeout(timer);
+        // 先攒一拍，再交给浏览器空闲时段：避免和流式渲染/滚动抢主线程
+        timer = setTimeout(() => {
+            timer = 0;
+            if (typeof window.requestIdleCallback === 'function') {
+                window.requestIdleCallback(run, { timeout: 600 });
+            } else {
+                run();
+            }
+        }, 300);
+    };
+})();
 
 /* ------------------------------------------------------------------ */
 /* 预设                                                                */
@@ -943,6 +1025,12 @@ function buildPanel() {
                 <summary>历史与超长消息</summary>
                 ${rowToggle('al-trim', '折叠较早消息', '更早的消息移出渲染树，顶部可一键展开', 'trimHistory')}
                 ${rowNumber('al-keep', '折叠后保留', '保留最近多少条消息可见', s.trimKeep, '条', 10, 3000, 10)}
+                ${rowSelect('al-nativelimit', '借用 ST 原生分页', '把 ST 的「聊天截断」设为固定条数：只渲染最近 N 条，顶部「Show more」可翻回；只影响显示、不影响上下文', s.nativeLimit, [
+                    [0, '不改（用 ST 当前设置）'],
+                    [100, '最近 100 条'],
+                    [150, '最近 150 条'],
+                    [300, '最近 300 条'],
+                ])}
                 ${rowToggle('al-clip', '超长消息折叠', '单条超过阈值的消息先显示前段，点「展开全文」看全', 'clipLong')}
                 ${rowNumber('al-clipchars', '长消息阈值', '单条消息字符数超过该值才折叠', s.clipChars, '字', 500, 20000, 500)}
             </details>
@@ -1088,6 +1176,7 @@ function updateBadge() {
 
 function resetSettings() {
     restoreStreamFps();
+    restoreNativeLimit();
     state.s = JSON.parse(JSON.stringify(DEFAULTS));
     settingsStore()[MODULE_NAME] = state.s;
     save();
@@ -1156,6 +1245,9 @@ function collectDiagnostics() {
         loadMs: state.chatLoadMs, loadCount: state.chatLoadCount, tps: state.tps,
         virtOn: document.body.classList.contains('antilag-virt'),
         cvSize: state.cvSize,
+        paging: nativePagingActive(),
+        tokenCounter: Boolean(pu.message_token_count_enabled),
+        renderMs: state.lastRenderMs,
     };
 }
 
@@ -1175,8 +1267,10 @@ function renderDiagnostics() {
         ['帧率', fps ? `${fps} FPS` : '采样中', fps && fps < s.fpsThreshold ? 'bad' : (fps && fps < 48 ? 'warn' : 'ok')],
         ['消息条数', String(d.chatLen || d.mesDom), (d.chatLen || d.mesDom) > 300 ? 'warn' : 'ok'],
         ['渲染条数', `${d.mesDom} / 虚拟化${d.virtOn ? '开' : '关'}`, (d.mesDom > 400 && !d.virtOn) ? 'warn' : 'ok'],
-        ['原生截断', d.nativeTrunc ? `最近 ${d.nativeTrunc} 条` : '不限（全量渲染）', d.nativeTrunc ? 'ok' : ((d.chatLen > 300) ? 'warn' : 'ok')],
+        ['原生截断', d.nativeTrunc ? `最近 ${d.nativeTrunc} 条${d.paging ? '（分页中）' : ''}` : '不限（全量渲染）', d.nativeTrunc ? 'ok' : ((d.chatLen > 300) ? 'warn' : 'ok')],
         ['上次加载', d.loadMs ? `${d.loadCount} 条 / ${Math.round(d.loadMs)}ms` : '—', d.loadMs > 1200 ? 'warn' : 'ok'],
+        ['消息落地', d.renderMs ? `${Math.round(d.renderMs)}ms` : '—', d.renderMs > 120 ? 'bad' : (d.renderMs > 70 ? 'warn' : 'ok')],
+        ['ST 逐条 token 计数', d.tokenCounter ? '开（生成/滑动时分词）' : '关', (d.tokenCounter && (d.chatLen || 0) > 200) ? 'warn' : 'ok'],
         ['输入延迟 10s', d.input.max ? `最大 ${Math.round(d.input.max)}ms` : '无慢事件', d.input.max > 200 ? 'bad' : (d.input.max > 100 ? 'warn' : 'ok')],
         ['DOM 节点', String(d.nodes), d.nodes > 4000 ? 'warn' : 'ok'],
         ['10s 长任务', `${lt.count} 次 / 最长 ${Math.round(lt.max)}ms`, lt.max > s.longTaskMs ? 'bad' : 'ok'],
@@ -1211,6 +1305,9 @@ function renderDiagnostics() {
     if (d.nativeTrunc && (d.chatLen || 0) > 300) tips.push('想让长聊天彻底顺滑：可在 ST「用户设置→聊天截断」设为 0 后交给虚拟化，或反向保持在 100 条更省');
     if (!d.nativeTrunc && (d.chatLen || 0) > 300 && !s.virtualize) tips.push('聊天截断为「不限」且消息很多，建议开启虚拟化或把 ST 聊天截断设成 100–200');
     if (d.input.max > 100) tips.push(`输入延迟最大 ${Math.round(d.input.max)}ms：按键被主线程计算挡住（世界书扫描/正则/向量检索/tokenizer），不是输入框本身问题`);
+    if (d.tokenCounter) tips.push('ST「显示每条消息 token」：消息落地和滑动时会分词一次，长聊天批量生成/大量滑动会加慢；不需要可在 ST 用户设置里关掉');
+    if (d.renderMs > 120) tips.push(`消息落地约 ${Math.round(d.renderMs)}ms（事件到稳定一帧，含其它扩展的收尾处理），先查是否开了逐条 token 计数/TTS/总结类扩展`);
+    if (!d.nativeTrunc && (d.chatLen || 0) > 500) tips.push('消息超过 500 条且聊天截断为「不限」：最有效的是「借用 ST 原生分页」设成 150–300，比折叠更原生');
     if (d.loadMs > 800) tips.push(`上次打开聊天耗时 ${Math.round(d.loadMs)}ms（${d.loadCount} 条），可调低聊天截断或开虚拟化改善后续滚动`);
     if (d.extCount > 10) tips.push(`已启用 ${d.extCount} 个扩展，建议逐个停用排查（尤其自带定时器的）`);
     if (isEditing()) tips.push('正在编辑消息，结构性优化已自动暂缓');
@@ -1338,8 +1435,23 @@ function makeDraggable(el, handle) {
     });
 }
 
-function restoreHudPos() {
-    if (!state.hudEl) return;
+function clampHudToViewport() {
+    const el = state.hudEl;
+    if (!el) return;
+    const vv = window.visualViewport;
+    const vw = (vv && vv.width) || window.innerWidth || 0;
+    const vh = (vv && vv.height) || window.innerHeight || 0;
+    if (!vw || !vh) return;
+    const r = el.getBoundingClientRect();
+    if (r.left < 0 || r.top < 0 || r.left + r.width > vw || r.top + r.height > vh) {
+        el.style.left = clamp(r.left, 4, Math.max(4, vw - r.width - 4)) + 'px';
+        el.style.top = clamp(r.top, 4, Math.max(4, vh - r.height - 4)) + 'px';
+        el.style.right = 'auto';
+        el.style.bottom = 'auto';
+    }
+}
+
+function restoreHudPos() {    if (!state.hudEl) return;
     const p = state.s && state.s.hudPos;
     if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) {
         state.hudEl.style.right = 'auto';
@@ -1589,14 +1701,14 @@ function registerEvents() {
             scheduleSweep();
         }));
     });
-    on('MESSAGE_RECEIVED', scheduleSweep);
-    on('MESSAGE_SENT', scheduleSweep);
+    on('MESSAGE_RECEIVED', () => { measureRender(); scheduleSweep(); });
+    on('MESSAGE_SENT', () => { measureRender(); scheduleSweep(); });
     on('MESSAGE_EDITED', scheduleSweep);
     on('MESSAGE_UPDATED', scheduleSweep);
     on('MESSAGE_SWIPED', scheduleSweep);
     on('MESSAGE_DELETED', scheduleSweep);
-    on('USER_MESSAGE_RENDERED', scheduleSweep);
-    on('CHARACTER_MESSAGE_RENDERED', scheduleSweep);
+    on('USER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); });
+    on('CHARACTER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); });
     on('MORE_MESSAGES_LOADED', () => { scheduleSweep(); scheduleMeasureCvSize(); });
     on('STREAM_TOKEN_RECEIVED', () => { state.tokens++; });
     on('GENERATION_STARTED', () => {
@@ -1628,8 +1740,9 @@ function registerEvents() {
 function init() {
     try {
         loadSettings();
-        // 上次会话留下过流式降频记录：先在启动时还原 ST 的原值，再按当前开关决定是否重新限流
+        // 上次会话留下过流式降频 / 原生分页记录：先还原 ST 原值，再按当前开关决定是否重新套用
         if (state.s.streamFpsOrig) restoreStreamFps();
+        if (state.s.truncApplied) restoreNativeLimit();
         applyAll();
         mountUi();
         observeChat();
@@ -1639,13 +1752,12 @@ function init() {
         startInputTiming();
 
         window.addEventListener('resize', () => {
-            if (!state.hudEl) return;
-            const r = state.hudEl.getBoundingClientRect();
-            if (r.left + r.width > window.innerWidth || r.top + r.height > window.innerHeight) {
-                state.hudEl.style.left = clamp(r.left, 4, Math.max(4, window.innerWidth - r.width - 4)) + 'px';
-                state.hudEl.style.top = clamp(r.top, 4, Math.max(4, window.innerHeight - r.height - 4)) + 'px';
-            }
+            clampHudToViewport();
         });
+        // 手机键盘弹出/收起走 visualViewport，普通的 resize 不一定触发
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', clampHudToViewport);
+        }
 
         console.log(`[AntiLag] v${VERSION} ready (${modeLabel()})`);
     } catch (err) {
@@ -1663,6 +1775,7 @@ if (document.readyState === 'loading') {
 export function onDisable() {
     if (!state.s) return Promise.resolve();
     restoreStreamFps();
+    restoreNativeLimit();
     state.s.enabled = false;
     applyAll();
     return Promise.resolve();
@@ -1689,6 +1802,7 @@ export function onEnable() {
 /** 生命周期钩子：更新/删除前清理残留（manifest.hooks.clean） */
 export function onCleanUp() {
     try { restoreStreamFps(); } catch (err) { /* 忽略 */ }
+    try { restoreNativeLimit(); } catch (err) { /* 忽略 */ }
     ['antilag', 'antilag-virt', 'antilag-contain', 'antilag-gen', 'antilag-scrolling']
         .forEach((cls) => document.body && document.body.classList.remove(cls));
     if (document.documentElement) document.documentElement.classList.remove('antilag');
