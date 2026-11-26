@@ -1,0 +1,33 @@
+name: Sync AntiLag v1.7.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/antilag-sync-v170.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download AntiLag files
+        run: |
+          curl -fsSL 'https://aka.doubaocdn.com/s/0MpNMHaPV9' -o index.js
+          curl -fsSL 'https://aka.doubaocdn.com/s/OV2CyoUVLs' -o style.css
+          curl -fsSL 'https://aka.doubaocdn.com/s/tdVlWWoGeu' -o manifest.json
+          curl -fsSL 'https://aka.doubaocdn.com/s/i8PVGCwkNa' -o README.md
+      - name: Commit and push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.js style.css manifest.json README.md
+          if git diff --cached --quiet; then
+            echo 'No changes'
+          else
+            git commit -m 'chore: AntiLag v1.7.0'
+            git push
+          fi
