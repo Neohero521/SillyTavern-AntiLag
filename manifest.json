@@ -1,0 +1,12 @@
+{
+  "display_name": "AntiLag 流畅优化",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "dependencies": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Doubao",
+  "version": "1.0.0",
+  "auto_update": false
+}
