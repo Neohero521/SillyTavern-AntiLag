@@ -10,31 +10,31 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.8';
+const VERSION = '1.7.9';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
     lite: {
         virtualize: true, lazyImg: true, genLite: true, willChange: true, lazyFrame: false,
         killBlur: false, killBgAnim: false, killShadow: false, killTransitions: false,
-        containChat: false, trimHistory: false, clipLong: false,
+        containChat: false, trimHistory: false, clipLong: false, smoothStreamSkip: false,
     },
     standard: {
         virtualize: true, lazyImg: true, genLite: true, willChange: true, lazyFrame: true,
         killBlur: true, killBgAnim: true, killShadow: false, killTransitions: false,
-        containChat: false, trimHistory: false, clipLong: false,
+        containChat: false, trimHistory: false, clipLong: false, smoothStreamSkip: true,
     },
     turbo: {
         virtualize: true, lazyImg: true, genLite: true, willChange: true, lazyFrame: true,
         killBlur: true, killBgAnim: true, killShadow: true, killTransitions: true,
-        containChat: true, trimHistory: true, clipLong: false,
+        containChat: true, trimHistory: true, clipLong: false, smoothStreamSkip: true,
     },
 };
 
 const MODE_LABEL = { lite: '轻度', standard: '均衡', turbo: '极速' };
 
 /** 极速模式（含自动降级）会额外拉起的纯视觉项 */
-const BOOST_KEYS = ['virtualize', 'killBlur', 'killBgAnim', 'killShadow', 'killTransitions', 'willChange', 'containChat'];
+const BOOST_KEYS = ['virtualize', 'killBlur', 'killBgAnim', 'killShadow', 'killTransitions', 'willChange', 'containChat', 'smoothStreamSkip'];
 const VISUAL_KEYS = Object.keys(PRESETS.turbo);
 
 /** 会随每条消息/每次生成触发额外工作的内置扩展（extension_settings 的键名） */
@@ -81,6 +81,8 @@ const DEFAULTS = {
     streamFpsApplied: 0,
     streamFadeSkip: false,
     fadeApplied: false,
+    smoothStreamSkip: false,
+    smoothApplied: false,
 
     autoDetect: true,
     fpsThreshold: 28,
@@ -100,6 +102,7 @@ const TOGGLES = [
     ['al-lazy', 'lazyImg'],
     ['al-lazyframe', 'lazyFrame'],
     ['al-fadeskip', 'streamFadeSkip'],
+    ['al-smoothskip', 'smoothStreamSkip'],
     ['al-willchange', 'willChange'],
     ['al-killblur', 'killBlur'],
     ['al-killblur-all', 'killBlurAll'],
@@ -200,6 +203,7 @@ const state = {
     codeFormatterHooked: false,
     codeRerenderPending: false,
     codeScanDone: false,
+    smoothApplied: false,
     charGuardTarget: null,
     charGuardObserver: null,
     charGuardInput: null,
@@ -391,6 +395,33 @@ function restoreStreamFadeSkip() {
     save();
 }
 
+/**
+ * ST 1.19 的「平滑流式」会在每个流式分片之间 await 一个人工延迟（标点更久），
+ * 生成越长越像挤牙膏；它不会减少主线程解析，但会拖长整体等待。生成期间临时关掉，
+ * 结束立即还原。只改 power_user.smooth_streaming，不动 ST 的 FPS 设置。
+ */
+function applySmoothStreamSkip() {
+    const pu = powerUser();
+    if (!pu || !state.s) return;
+    const want = Boolean(isOn() && state.generating && state.s.smoothStreamSkip);
+    if (!want) { restoreSmoothStreamSkip(); return; }
+    if (pu.smooth_streaming) {
+        state.s.smoothApplied = true;
+        state.smoothApplied = true;
+        save();
+        pu.smooth_streaming = false;
+    }
+}
+
+function restoreSmoothStreamSkip() {
+    const pu = powerUser();
+    if (!pu || !state.s || !state.s.smoothApplied) return;
+    if (pu.smooth_streaming === false) pu.smooth_streaming = true;
+    state.s.smoothApplied = false;
+    state.smoothApplied = false;
+    save();
+}
+
 /** 生成期间新消息可能落在热区之外：补一次热区标记（消息是直接子节点，成本极低） */
 function hotZoneTick() {
     if (!isOn() || !document.body.classList.contains('antilag-virt')) return;
@@ -469,7 +500,14 @@ function loadSettings() {
     s.streamFpsOrig = clamp(parseInt(s.streamFpsOrig, 10) || 0, 0, 240);
     s.streamFpsApplied = clamp(parseInt(s.streamFpsApplied, 10) || 0, 0, 240);
     s.fadeApplied = Boolean(s.fadeApplied);
-    s.nativeLimit = [0, 100, 150, 300].includes(Number(s.nativeLimit)) ? Number(s.nativeLimit) : 0;
+    // v1.7.9 新设置：老用户如果已经是均衡/极速档，默认继承该档的「生成期关平滑流式」；
+    // 轻度档仍保持关闭，避免安装后悄悄改变原有的逐字节奏。
+    if (incoming.smoothStreamSkip === undefined && (s.mode === 'standard' || s.mode === 'turbo')) {
+        s.smoothStreamSkip = true;
+    }
+    s.smoothStreamSkip = s.smoothStreamSkip === undefined ? DEFAULTS.smoothStreamSkip : Boolean(s.smoothStreamSkip);
+    s.smoothApplied = Boolean(s.smoothApplied);
+    s.nativeLimit = [0, 50, 80, 100, 150, 300].includes(Number(s.nativeLimit)) ? Number(s.nativeLimit) : 0;
     s.truncOrig = clamp(parseInt(s.truncOrig, 10) || 0, 0, 5000);
     s.truncApplied = Boolean(s.truncApplied);
     // 兼容 v1.6.0 旧数据：没有记录「我们写进去的值」时回落到 nativeLimit
@@ -862,10 +900,12 @@ function applyAll() {
         targetStreamFps();
         applyNativeLimit();
         applyStreamFadeSkip();
+        applySmoothStreamSkip();
     } else {
         restoreStreamFps();
         restoreNativeLimit();
         restoreStreamFadeSkip();
+        restoreSmoothStreamSkip();
     }
     if (on && state.nativeChanged && !state.generating && !state.chatLoading) {
         // 生成中/加载中先留着标记，结束后再统一重渲染
@@ -1934,6 +1974,7 @@ function buildPanel() {
                     [10, '上限 10 FPS（更省，文本更跳）'],
                 ])}
                 ${rowToggle('al-fadeskip', '生成时临时关闭流式淡入', 'ST 的淡入每个 tick 都要整条消息重新分词 + morphdom；长消息时关掉可明显减负（生成结束自动还原）', 'streamFadeSkip')}
+                ${rowToggle('al-smoothskip', '生成时临时关闭平滑流式', 'ST 1.19 的平滑流式会在每个流式分片之间 await 人工延迟，标点更久；关掉只影响生成时的吐字节奏，结束自动还原', 'smoothStreamSkip')}
                 ${rowToggle('al-lazy', '图片懒加载', '聊天内图片改为 lazy + async 解码', 'lazyImg')}
                 ${rowToggle('al-lazyframe', 'iframe 懒加载', '消息里的网页/视频卡片延迟加载', 'lazyFrame')}
                 ${rowToggle('al-willchange', '清理 will-change', '回收被主题滥用的 GPU 图层，降低移动端内存压力', 'willChange')}
@@ -1957,6 +1998,8 @@ function buildPanel() {
                 ${rowNumber('al-keep', '折叠后保留', '保留最近多少条消息可见', s.trimKeep, '条', 10, 3000, 10)}
                 ${rowSelect('al-nativelimit', '借用 ST 原生分页', '把 ST 的「聊天截断」设为固定条数，改完立即重渲染；只影响显示、不影响上下文', s.nativeLimit, [
                     [0, '不改（用 ST 当前设置）'],
+                    [50, '最近 50 条（手机推荐）'],
+                    [80, '最近 80 条'],
                     [100, '最近 100 条'],
                     [150, '最近 150 条'],
                     [300, '最近 300 条'],
@@ -2139,6 +2182,7 @@ function resetSettings() {
     restoreStreamFps();
     restoreNativeLimit();
     restoreStreamFadeSkip();
+    restoreSmoothStreamSkip();
     state.s = JSON.parse(JSON.stringify(DEFAULTS));
     settingsStore()[MODULE_NAME] = state.s;
     save();
@@ -2234,12 +2278,14 @@ function collectDiagnostics() {
     const pu = powerUser() || {};
     const nativeTrunc = Number(pu.chat_truncation) || 0;
     const stStreamFps = Number(pu.streaming_fps) || 0;
+    const smoothStreaming = Boolean(pu.smooth_streaming);
+    const reducedMotion = Boolean(pu.reduced_motion);
     const input = recentInput();
 
     return {
         chatLen, mesDom, nodes, extCount, imgCount, blurCount, wcCount, longest, bgAnim,
         codeCount, codeChars,
-        nativeTrunc, stStreamFps, input,
+        nativeTrunc, stStreamFps, smoothStreaming, reducedMotion, input,
         loadMs: state.chatLoadMs, loadCount: state.chatLoadCount, tps: state.tps,
         virtOn: document.body.classList.contains('antilag-virt'),
         cvSize: state.cvSize,
@@ -2280,6 +2326,8 @@ function renderDiagnostics() {
         ['生成期长任务', `${state.lastGenLt} 次${d.tps ? ` / ${d.tps} TPS` : ''}`, state.lastGenLt > 3 ? 'warn' : 'ok'],
         ['流式帧率', d.stStreamFps ? `${d.stStreamFps} FPS` : '未知', (d.stStreamFps >= 30 && state.lastGenLt > 3) ? 'warn' : 'ok'],
         ['流式淡入', d.fadeIn ? '开（每 tick 重建分段）' : '关', d.fadeIn ? 'warn' : 'ok'],
+        ['平滑流式', d.smoothStreaming ? '开（逐字延时）' : '关', d.smoothStreaming ? 'warn' : 'ok'],
+        ['减少动画', d.reducedMotion ? '开' : '关', d.reducedMotion ? 'ok' : 'ok'],
         ['ST 快速 UI', d.fastUi ? '开（全界面无模糊）' : '关', (!d.fastUi && d.blurCount > 0) ? 'warn' : 'ok'],
         ['正则脚本', String(d.regexCount), d.regexCount > 5 ? 'warn' : 'ok'],
         ['毛玻璃元素', String(d.blurCount), d.blurCount > 0 ? 'warn' : 'ok'],
@@ -2311,6 +2359,11 @@ function renderDiagnostics() {
     if (state.lastGenLt > 3 && d.stStreamFps >= 25 && !s.streamFps) {
         tips.push(`ST 流式刷新是 ${d.stStreamFps} FPS，每个 tick 都要重跑正则+净化+Markdown；可把「流式降频」设到 15–20`);
     }
+    try {
+        if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches && !d.nativeTrunc && d.mesDom > 80) {
+            tips.push('当前像移动端且没有原生截断：可在「借用 ST 原生分页」选最近 50–80 条，显著减少要布局的 DOM');
+        }
+    } catch (err) { /* 忽略 */ }
     if (d.nativeTrunc) {
         tips.push(`ST 原生「聊天截断」为 ${d.nativeTrunc} 条：更早消息本来就不渲染，无需再开「折叠较早消息」`);
         if (d.nativeTrunc > 200 && (d.chatLen || 0) > 300) tips.push('若仍卡，可把原生截断降到 100–150 更省，只影响显示、不改变上下文');
@@ -2319,6 +2372,8 @@ function renderDiagnostics() {
     }
     if (d.input.max > 100) tips.push(`输入延迟最大 ${Math.round(d.input.max)}ms：按键被主线程计算挡住（世界书扫描/正则/向量检索/tokenizer），不是输入框本身问题`);
     if (d.fadeIn && !s.streamFadeSkip) tips.push('「流式淡入」每个 tick 都要把整条消息按词重切 span 再 morphdom，长消息会明显卡；可开「生成时临时关闭流式淡入」或在 ST 里关掉');
+    if (d.smoothStreaming && !s.smoothStreamSkip) tips.push('ST「平滑流式」会在每个流式分片之间插入人工延迟，长回复会更慢；可开「生成时临时关闭平滑流式」');
+    if (!d.reducedMotion && !s.killTransitions) tips.push('ST 官方建议开启「减少动画」：用户设置 → 界面主题里勾选 Reduced motion，可去掉装饰性过渡与动画');
     if (!d.fastUi && d.blurCount > 0) tips.push('ST 自带「快速 UI 模式」能一键去掉全界面毛玻璃（比逐项关更彻底），在 ST 用户设置里开启即可');
     if (d.regexCount > 5) tips.push(`已启用 ${d.regexCount} 条正则脚本，每条消息渲染都要全跑一遍；不常用的先在「正则」扩展里停用`);
     if (d.tokenCounter) tips.push('ST「显示每条消息 token」：消息落地和滑动时会分词一次，长聊天批量生成/大量滑动会加慢；不需要可在 ST 用户设置里关掉');
@@ -2684,6 +2739,7 @@ function registerEvents() {
         state.genT0 = 0;
         document.body.classList.remove('antilag-gen');
         restoreStreamFadeSkip();
+        restoreSmoothStreamSkip();
         if (state.nativeChanged && !state.chatLoading) {
             state.nativeChanged = false;
             rerenderChatSoon();
@@ -2708,6 +2764,7 @@ function init() {
         if (state.s.streamFpsOrig) restoreStreamFps();
         if (state.s.truncApplied) restoreNativeLimit();
         if (state.s.fadeApplied) restoreStreamFadeSkip();
+        if (state.s.smoothApplied) restoreSmoothStreamSkip();
         applyAll();
         registerCodeFormatterHooks();
         scheduleCodeHydration();
@@ -2739,6 +2796,7 @@ export function onDisable() {
     restoreStreamFps();
     restoreNativeLimit();
     restoreStreamFadeSkip();
+    restoreSmoothStreamSkip();
     state.s.enabled = false;
     state.boost = false;
     state.generating = false;
@@ -2789,6 +2847,7 @@ export function onCleanUp() {
     try { restoreStreamFps(); } catch (err) { /* 忽略 */ }
     try { restoreNativeLimit(); } catch (err) { /* 忽略 */ }
     try { restoreStreamFadeSkip(); } catch (err) { /* 忽略 */ }
+    try { restoreSmoothStreamSkip(); } catch (err) { /* 忽略 */ }
     if (state.tickTimer) { clearInterval(state.tickTimer); state.tickTimer = 0; }
     if (state.chatLoadTimer) { clearTimeout(state.chatLoadTimer); state.chatLoadTimer = 0; }
     stopFpsLoop();
