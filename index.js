@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.3';
+const VERSION = '1.7.4';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -1280,6 +1280,8 @@ function replaceCodeTokens(html) {
         out = out.replace(new RegExp(`<p>\\s*${token}\\s*</p>`, 'g'), block);
         out = out.split(token).join(block);
     }
+    // 这一钩子返回后 ST 才把 HTML 写进 .mes_text；下一帧再补水，确保空壳已经在 DOM 里
+    scheduleCodeHydration();
     return out;
 }
 
