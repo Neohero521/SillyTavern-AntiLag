@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.7.2';
+const VERSION = '1.7.3';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -191,7 +191,6 @@ const state = {
     codeSeq: 0,
     codePending: null,
     codeViewHandlers: new Map(),
-    codeHighlightEntries: new Map(),
     codeHydrateRaf: 0,
     codeIO: null,
     codeFormatterHooked: false,
@@ -987,11 +986,11 @@ function formatCount(n) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 可见区语法着色（CSS Custom Highlight API）                          */
+/* 可视行虚拟渲染：2M+ 字符也只让浏览器画几十行                        */
 /* ------------------------------------------------------------------ */
-// 不生成任何 <span>：完整代码始终是一个文本节点，只给“当前可见的几十行”
-// 建立 Range 并交给浏览器原生高亮。DOM 节点数不随代码长度增长，滚动时
-// 只重算可视窗口，因此几十万字符也不会把页面拖死。
+// 完整代码保存在 state.codeBlocks 里，DOM 只保留“当前滚动窗口内的行”。
+// 关键：不再把一个 2.69M 字符的文本节点塞进 pre，避免浏览器在超长文本
+// 节点上布局/绘制失败；同时只给这些行生成 span，节点数不随总代码增长。
 
 const CODE_KEYWORDS = new Set([
     'abstract', 'as', 'async', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue',
@@ -1002,27 +1001,13 @@ const CODE_KEYWORDS = new Set([
     'def', 'elif', 'except', 'exec', 'global', 'lambda', 'nonlocal', 'pass', 'raise', 'print',
     'and', 'or', 'not', 'is', 'assert', 'del', 'None', 'True', 'False',
     'fn', 'impl', 'mut', 'pub', 'trait', 'use', 'where', 'match', 'loop', 'struct', 'crate',
-    'select', 'insert', 'update', 'create', 'table', 'drop', 'alter', 'join', 'where', 'group',
+    'select', 'insert', 'update', 'create', 'table', 'drop', 'alter', 'join', 'group',
     'order', 'limit', 'values', 'into', 'primary', 'key', 'foreign', 'references', 'index',
 ]);
 const CODE_LITERALS = new Set(['true', 'false', 'null', 'undefined', 'None', 'True', 'False', 'nil', 'NaN', 'Infinity']);
 const CODE_TOKEN_RE = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\/\/[^\n]*|\/\*[\s\S]*?\*\/|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*\b)/g;
-
-function supportsCustomHighlight() {
-    return typeof window !== 'undefined'
-        && typeof window.Highlight === 'function'
-        && !!window.CSS && !!window.CSS.highlights;
-}
-
-function codeLineStarts(text) {
-    const starts = [0];
-    let at = text.indexOf('\n');
-    while (at !== -1) {
-        starts.push(at + 1);
-        at = text.indexOf('\n', at + 1);
-    }
-    return starts;
-}
+const CODE_LINE_MAX = 2000;
+const CODE_LINE_HEIGHT = 20;
 
 function codeTokenType(token, index, source) {
     if (!token) return '';
@@ -1039,119 +1024,92 @@ function codeTokenType(token, index, source) {
     return '';
 }
 
-function codeTokenRanges(text, startOffset, endOffset) {
-    const source = text.slice(startOffset, endOffset);
-    const out = { keyword: [], string: [], comment: [], number: [], literal: [], title: [], property: [] };
+function codeVisualLines(code) {
+    // 超长单行（压缩后的前端代码常见）按 2000 字切段，避免“一行 2.69M”
+    // 又把浏览器顶回超长文本节点的问题；复制时仍用 rec.code，原文不变。
+    const rows = [];
+    String(code == null ? '' : code).replace(/\r\n?/g, '\n').split('\n').forEach((line) => {
+        if (line.length <= CODE_LINE_MAX) {
+            rows.push(line);
+            return;
+        }
+        for (let at = 0; at < line.length; at += CODE_LINE_MAX) {
+            rows.push(line.slice(at, at + CODE_LINE_MAX));
+        }
+    });
+    return rows;
+}
+
+function highlightCodeLine(line) {
+    if (!line) return '';
+    let out = '';
+    let last = 0;
     CODE_TOKEN_RE.lastIndex = 0;
     let m;
-    while ((m = CODE_TOKEN_RE.exec(source)) !== null) {
-        const token = m[0];
-        const type = codeTokenType(token, m.index, source);
-        if (!type) continue;
-        out[type].push([startOffset + m.index, startOffset + m.index + token.length]);
+    while ((m = CODE_TOKEN_RE.exec(line)) !== null) {
+        if (m.index > last) out += escapeCodeHtml(line.slice(last, m.index));
+        const type = codeTokenType(m[0], m.index, line);
+        if (type) {
+            out += `<span class="al-code-token al-code-token-${type}">${escapeCodeHtml(m[0])}</span>`;
+        } else {
+            out += escapeCodeHtml(m[0]);
+        }
+        last = m.index + m[0].length;
         if (CODE_TOKEN_RE.lastIndex === m.index) CODE_TOKEN_RE.lastIndex++;
     }
+    out += escapeCodeHtml(line.slice(last));
     return out;
 }
 
-function clearCodeHighlights() {
-    if (!supportsCustomHighlight()) return;
-    ['keyword', 'string', 'comment', 'number', 'literal', 'title', 'property'].forEach((type) => {
-        window.CSS.highlights.delete(`al-code-${type}`);
-    });
-}
-
-function applyCodeHighlights() {
-    if (!supportsCustomHighlight()) return;
-    const combined = { keyword: [], string: [], comment: [], number: [], literal: [], title: [], property: [] };
-    for (const [pre, entry] of state.codeHighlightEntries) {
-        if (!pre || !pre.isConnected) {
-            state.codeHighlightEntries.delete(pre);
-            continue;
-        }
-        for (const type of Object.keys(combined)) {
-            if (entry[type] && entry[type].length) combined[type].push(...entry[type]);
-        }
+function renderCodeWindow(pre) {
+    const st = pre && pre.__alCodeState;
+    if (!st || !pre.isConnected) return;
+    const viewH = pre.clientHeight || 300;
+    const top = pre.scrollTop || 0;
+    const first = Math.max(0, Math.floor(top / CODE_LINE_HEIGHT) - 10);
+    const last = Math.min(st.lines.length, first + Math.ceil(viewH / CODE_LINE_HEIGHT) + 24);
+    st.top.style.height = `${first * CODE_LINE_HEIGHT}px`;
+    st.bottom.style.height = `${(st.lines.length - last) * CODE_LINE_HEIGHT}px`;
+    let html = '';
+    for (let i = first; i < last; i++) {
+        html += `<div class="al-code-line">${highlightCodeLine(st.lines[i])}</div>`;
     }
-    for (const type of Object.keys(combined)) {
-        const ranges = combined[type];
-        if (!ranges.length) {
-            window.CSS.highlights.delete(`al-code-${type}`);
-            continue;
-        }
-        try {
-            window.CSS.highlights.set(`al-code-${type}`, new window.Highlight(...ranges));
-        } catch (err) { /* 某些浏览器对空/跨节点 range 比较挑，跳过 */ }
-    }
-}
-
-function refreshCodeHighlight(pre) {
-    if (!supportsCustomHighlight() || !pre || !pre.isConnected) return;
-    const text = pre.textContent || '';
-    if (!text) return;
-    const lineHeight = parseFloat(getComputedStyle(pre).lineHeight) || 20;
-    const viewH = pre.clientHeight || 0;
-    if (!viewH) return;
-    if (!pre.__alLineStarts || pre.__alText !== text) {
-        pre.__alText = text;
-        pre.__alLineStarts = codeLineStarts(text);
-    }
-    const starts = pre.__alLineStarts;
-    const firstLine = Math.max(0, Math.floor((pre.scrollTop || 0) / lineHeight) - 8);
-    // 最多着色 400 行：正常 62vh 窗口只有几十行，这里是防止主题把 max-height 改没后的兜底
-    const lastLine = Math.min(starts.length, firstLine + 400,
-        Math.ceil(((pre.scrollTop || 0) + viewH) / lineHeight) + 8);
-    const startOffset = starts[firstLine] || 0;
-    const endOffset = lastLine < starts.length ? starts[lastLine] : text.length;
-    const ranges = codeTokenRanges(text, startOffset, endOffset);
-    const nodes = [];
-    const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
-    let node;
-    let offsetBase = 0;
-    while ((node = walker.nextNode())) {
-        const len = node.nodeValue ? node.nodeValue.length : 0;
-        nodes.push({ node, start: offsetBase, end: offsetBase + len });
-        offsetBase += len;
-    }
-    if (!nodes.length) return;
-    const mapped = {};
-    for (const type of Object.keys(ranges)) {
-        mapped[type] = [];
-        for (const [start, end] of ranges[type]) {
-            const from = nodes.find((n) => start >= n.start && start <= n.end);
-            const to = nodes.find((n) => end >= n.start && end <= n.end);
-            if (!from || !to || from.node !== to.node) continue;
-            try {
-                const range = document.createRange();
-                range.setStart(from.node, start - from.start);
-                range.setEnd(to.node, end - to.start);
-                mapped[type].push(range);
-            } catch (err) { /* 跳过 */ }
-        }
-    }
-    state.codeHighlightEntries.set(pre, mapped);
-    applyCodeHighlights();
+    st.body.innerHTML = html;
 }
 
 function hydrateCodeView(pre) {
     if (!pre || pre.dataset.alCodeHydrated === '1') return;
     pre.dataset.alCodeHydrated = '1';
-    if (!pre.textContent) return;
-    pre.normalize();
-    if (!supportsCustomHighlight()) return;
-    if (state.codeViewHandlers.has(pre)) return;
+    const block = pre.closest && pre.closest('.al-code-full');
+    const rec = block && state.codeBlocks.get(block.dataset.alCode);
+    if (!rec) {
+        pre.textContent = '代码数据已释放，请刷新聊天';
+        return;
+    }
+    const lines = codeVisualLines(rec.code);
+    if (!lines.length) return;
+    const top = document.createElement('div');
+    const body = document.createElement('div');
+    const bottom = document.createElement('div');
+    top.className = 'al-code-top';
+    body.className = 'al-code-lines';
+    bottom.className = 'al-code-bottom';
+    pre.textContent = '';
+    pre.appendChild(top);
+    pre.appendChild(body);
+    pre.appendChild(bottom);
+    pre.__alCodeState = { lines, top, body, bottom };
     let frame = 0;
     const onScroll = () => {
         if (frame) return;
         frame = requestAnimationFrame(() => {
             frame = 0;
-            refreshCodeHighlight(pre);
+            renderCodeWindow(pre);
         });
     };
     pre.addEventListener('scroll', onScroll, { passive: true });
     state.codeViewHandlers.set(pre, onScroll);
-    // 首次布局完成后再计算可见行
-    requestAnimationFrame(() => refreshCodeHighlight(pre));
+    requestAnimationFrame(() => renderCodeWindow(pre));
 }
 
 function cleanupCodeView(pre) {
@@ -1159,7 +1117,7 @@ function cleanupCodeView(pre) {
     const handler = state.codeViewHandlers.get(pre);
     if (handler) pre.removeEventListener('scroll', handler);
     state.codeViewHandlers.delete(pre);
-    state.codeHighlightEntries.delete(pre);
+    if (pre.__alCodeState) pre.__alCodeState = null;
 }
 
 function hydrateCodeViews() {
@@ -1177,7 +1135,6 @@ function hydrateCodeViews() {
         block.dataset.alCodeReady = '1';
         hydrateCodeView(pre);
     });
-    applyCodeHighlights();
 }
 
 function ensureCodeObserver() {
@@ -1188,7 +1145,12 @@ function ensureCodeObserver() {
             const block = entry.target;
             const pre = block.querySelector && block.querySelector('.al-code-view');
             if (!pre) return;
-            requestAnimationFrame(() => refreshCodeHighlight(pre));
+            if (pre.dataset.alCodeHydrated === '1') {
+                requestAnimationFrame(() => renderCodeWindow(pre));
+            } else if (block.dataset.alCodeReady !== '1') {
+                block.dataset.alCodeReady = '1';
+                hydrateCodeView(pre);
+            }
         });
     }, { rootMargin: '200px 0px' });
     return state.codeIO;
@@ -1205,14 +1167,14 @@ function scheduleCodeHydration() {
 function cleanupCodeViews() {
     for (const pre of state.codeViewHandlers.keys()) cleanupCodeView(pre);
     state.codeViewHandlers.clear();
-    state.codeHighlightEntries.clear();
-    clearCodeHighlights();
-    // 允许关闭后再打开时重新挂可视区着色；代码本身仍然完整保留
     document.querySelectorAll('.al-code-full').forEach((block) => {
         delete block.dataset.alCodeReady;
         block.__alIoObserved = false;
         const pre = block.querySelector('.al-code-view');
-        if (pre) delete pre.dataset.alCodeHydrated;
+        if (pre) {
+            delete pre.dataset.alCodeHydrated;
+            pre.__alCodeState = null;
+        }
     });
     if (state.codeIO) {
         try { state.codeIO.disconnect(); } catch (err) { /* 忽略 */ }
@@ -1238,14 +1200,14 @@ function pruneCodeMessage(mesId) {
 }
 
 function buildFullCodeBlock(rec) {
-    // 完整代码始终作为纯文本放进 pre（不包 <code>），所以 ST 的
-    // addCopyToCodeBlocks() 不会对它再跑 hljs.highlightElement()。
-    // 语法颜色由 CSS Custom Highlight API 只给“可视行”上色，不生成 span。
+    // 代码正文不放进 HTML 字符串：避免 2M+ 字符的文本先被 DOMPurify 扫一遍，
+    // 也避免浏览器在超长文本节点上布局失败。渲染后由 hydrateCodeView()
+    // 从 state.codeBlocks 取出完整代码，只填充可视窗口的行。
     return `<div class="al-code-full" data-al-code="${rec.key}" data-al-code-len="${rec.chars}">`
         + '<div class="al-code-head"><span class="al-code-title">代码块</span>'
         + `<span class="al-code-meta">${escapeCodeHtml(rec.lang)} · ${formatCount(rec.chars)} 字符</span>`
         + '<span class="al-code-copy" role="button" tabindex="0" data-al-code-action="copy">复制</span></div>'
-        + `<pre class="al-code-view" data-al-code-view tabindex="0">${escapeCodeHtml(rec.code)}</pre>`
+        + '<pre class="al-code-view" data-al-code-view tabindex="0"><span class="al-code-loading">代码加载中…</span></pre>'
         + '</div>';
 }
 
@@ -1871,9 +1833,9 @@ function buildPanel() {
             <details class="al-fold">
                 <summary>历史与超长消息</summary>
                 ${rowToggle('al-trim', '折叠较早消息', '更早的消息移出渲染树，顶部可一键展开', 'trimHistory')}
-                ${rowToggle('al-codedefer', '超大代码完整直出', '代码一个字都不少，但绕过 Showdown 解析和 hljs 高亮；普通小代码块仍走 ST 原生渲染', 'codeDefer')}
-                ${rowNumber('al-codethreshold', '单块直出阈值', '单个代码块超过该字符数就走完整直出；低于阈值仍由 ST 原生解析并高亮', s.codeDeferChars, '字', 1000, 200000)}
-                ${rowNumber('al-codetotal', '单条消息代码总量阈值', '一条消息里所有代码加起来超过该值，即使单块不大也全部走完整直出；0 表示只看单块阈值', s.codeDeferTotalChars, '字', 0, 500000)}
+                ${rowToggle('al-codedefer', '超大代码可视行直出', '代码一个字都不少；块内只渲染当前滚动窗口的行，绕过 Showdown 与 hljs；滚动查看、复制全文', 'codeDefer')}
+                ${rowNumber('al-codethreshold', '单块直出阈值', '单个代码块超过该字符数就走可视行直出；低于阈值仍由 ST 原生解析并高亮', s.codeDeferChars, '字', 1000, 200000)}
+                ${rowNumber('al-codetotal', '单条消息代码总量阈值', '一条消息里所有代码加起来超过该值，即使单块不大也全部走可视行直出；0 表示只看单块阈值', s.codeDeferTotalChars, '字', 0, 500000)}
                 ${rowToggle('al-chartokenskip', '跳过超大角色字段 Token 统计', '角色卡简介/示例/首条消息含巨量代码时，ST 会逐个字段 await 分词；跳过超大字段可显著加快打开角色卡', 'charTokenSkip')}
                 ${rowNumber('al-chartokenthreshold', '角色字段阈值', '字段超过该字符数才跳过 Token 统计；只影响统计显示，不改角色卡内容', s.charTokenSkipChars, '字', 5000, 200000)}
                 ${rowNumber('al-keep', '折叠后保留', '保留最近多少条消息可见', s.trimKeep, '条', 10, 3000, 10)}
@@ -2584,7 +2546,7 @@ function registerEvents() {
     on('USER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); scheduleCodeHydration(); });
     on('CHARACTER_MESSAGE_RENDERED', () => { measureRender(); hotZoneTick(); scheduleSweep(); scheduleCodeHydration(); });
     on('MORE_MESSAGES_LOADED', () => { scheduleSweep(); scheduleMeasureCvSize(); scheduleCodeHydration(); });
-    on('STREAM_TOKEN_RECEIVED', () => { state.tokens++; });
+    on('STREAM_TOKEN_RECEIVED', () => { state.tokens++; scheduleCodeHydration(); });
     on('GENERATION_STARTED', () => {
         state.generating = true;
         state.genLt = 0;
