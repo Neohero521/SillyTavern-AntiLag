@@ -1,5 +1,5 @@
 /**
- * AntiLag 流畅优化 v1.1 —— SillyTavern 扩展
+ * AntiLag 流畅优化 v1.4 —— SillyTavern 扩展
  *
  * 设计原则：
  * 1) 默认「轻度」模式视觉零改动，只做不改变观感的减负；
@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -68,6 +68,8 @@ const DEFAULTS = {
     scrollIdle: true,
     streamFps: 0,
     streamFpsOrig: 0,
+    streamFadeSkip: false,
+    fadeApplied: false,
 
     autoDetect: true,
     fpsThreshold: 28,
@@ -88,6 +90,7 @@ const TOGGLES = [
     ['al-virtualize', 'virtualize'],
     ['al-lazy', 'lazyImg'],
     ['al-lazyframe', 'lazyFrame'],
+    ['al-fadeskip', 'streamFadeSkip'],
     ['al-willchange', 'willChange'],
     ['al-killblur', 'killBlur'],
     ['al-killblur-all', 'killBlurAll'],
@@ -304,6 +307,37 @@ function applyNativeLimit() {
     return want;
 }
 
+/**
+ * ST 的「流式淡入」(power_user.stream_fade_in) 每个 tick 都会：clone 整条消息 →
+ * 用 Intl.Segmenter 把每个词包成 <span class="text_segment"> → morphdom 全树 diff。
+ * 长消息 + 30 FPS 下非常贵。这里只在生成期间临时关掉，结束后还原（记录状态防止崩溃后丢失）。
+ */
+function applyStreamFadeSkip() {
+    const pu = powerUser();
+    if (!pu) return;
+    const want = Boolean(isOn() && state.generating && state.s && state.s.streamFadeSkip);
+    if (!want) { restoreStreamFadeSkip(); return; }
+    if (pu.stream_fade_in) {
+        state.s.fadeApplied = true;
+        save();
+        pu.stream_fade_in = false;
+    }
+}
+
+function restoreStreamFadeSkip() {
+    const pu = powerUser();
+    if (!pu || !state.s || !state.s.fadeApplied) return;
+    if (pu.stream_fade_in !== true) pu.stream_fade_in = true;
+    state.s.fadeApplied = false;
+    save();
+}
+
+/** 生成期间新消息可能落在热区之外：补一次热区标记（消息是直接子节点，成本极低） */
+function hotZoneTick() {
+    if (!isOn() || !document.body.classList.contains('antilag-virt')) return;
+    applyHotZone();
+}
+
 function restoreNativeLimit() {
     const pu = powerUser();
     if (!pu || !state.s || !state.s.truncApplied) return;
@@ -333,6 +367,7 @@ function loadSettings() {
     s.longTaskMs = clamp(parseInt(s.longTaskMs, 10) || DEFAULTS.longTaskMs, 50, 3000);
     s.streamFps = [0, 10, 15, 20].includes(Number(s.streamFps)) ? Number(s.streamFps) : 0;
     s.streamFpsOrig = clamp(parseInt(s.streamFpsOrig, 10) || 0, 0, 240);
+    s.fadeApplied = Boolean(s.fadeApplied);
     s.nativeLimit = [0, 100, 150, 300].includes(Number(s.nativeLimit)) ? Number(s.nativeLimit) : 0;
     s.truncOrig = clamp(parseInt(s.truncOrig, 10) || 0, 0, 5000);
     s.truncApplied = Boolean(s.truncApplied);
@@ -434,6 +469,8 @@ function buildCss() {
         css += [
             '/* 生成中：隔离最后一条消息的重绘，并去掉其重特效 */',
             'body.antilag-gen #chat .last_mes{contain:layout paint style;}',
+            '/* 正在流式的最后一条绝不跳过布局，避免 content-visibility 与逐字重绘打架 */',
+            'body.antilag-gen #chat .mes:last-child{content-visibility:visible !important;}',
             'body.antilag-gen #chat .last_mes,body.antilag-gen #chat .last_mes *{box-shadow:none !important;text-shadow:none !important;filter:none !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;transition:none !important;animation:none !important;}',
             '',
         ].join('\n');
@@ -681,9 +718,11 @@ function applyAll() {
     if (on) {
         targetStreamFps();
         applyNativeLimit();
+        applyStreamFadeSkip();
     } else {
         restoreStreamFps();
         restoreNativeLimit();
+        restoreStreamFadeSkip();
     }
     if (!on) {
         clearStructural();
@@ -1010,6 +1049,7 @@ function buildPanel() {
                     [15, '上限 15 FPS'],
                     [10, '上限 10 FPS（更省，文本更跳）'],
                 ])}
+                ${rowToggle('al-fadeskip', '生成时临时关闭流式淡入', 'ST 的淡入每个 tick 都要整条消息重新分词 + morphdom；长消息时关掉可明显减负（生成结束自动还原）', 'streamFadeSkip')}
                 ${rowToggle('al-lazy', '图片懒加载', '聊天内图片改为 lazy + async 解码', 'lazyImg')}
                 ${rowToggle('al-lazyframe', 'iframe 懒加载', '消息里的网页/视频卡片延迟加载', 'lazyFrame')}
                 ${rowToggle('al-willchange', '清理 will-change', '回收被主题滥用的 GPU 图层，降低移动端内存压力', 'willChange')}
@@ -1247,6 +1287,10 @@ function collectDiagnostics() {
         cvSize: state.cvSize,
         paging: nativePagingActive(),
         tokenCounter: Boolean(pu.message_token_count_enabled),
+        fadeIn: Boolean(pu.stream_fade_in),
+        fastUi: Boolean(pu.fast_ui_mode),
+        regexCount: Array.isArray(c && c.extensionSettings && c.extensionSettings.regex)
+            ? c.extensionSettings.regex.length : 0,
         renderMs: state.lastRenderMs,
     };
 }
@@ -1276,6 +1320,9 @@ function renderDiagnostics() {
         ['10s 长任务', `${lt.count} 次 / 最长 ${Math.round(lt.max)}ms`, lt.max > s.longTaskMs ? 'bad' : 'ok'],
         ['生成期长任务', `${state.lastGenLt} 次${d.tps ? ` / ${d.tps} TPS` : ''}`, state.lastGenLt > 3 ? 'warn' : 'ok'],
         ['流式帧率', d.stStreamFps ? `${d.stStreamFps} FPS` : '未知', (d.stStreamFps >= 30 && state.lastGenLt > 3) ? 'warn' : 'ok'],
+        ['流式淡入', d.fadeIn ? '开（每 tick 重建分段）' : '关', d.fadeIn ? 'warn' : 'ok'],
+        ['ST 快速 UI', d.fastUi ? '开（全界面无模糊）' : '关', (!d.fastUi && d.blurCount > 0) ? 'warn' : 'ok'],
+        ['正则脚本', String(d.regexCount), d.regexCount > 5 ? 'warn' : 'ok'],
         ['毛玻璃元素', String(d.blurCount), d.blurCount > 0 ? 'warn' : 'ok'],
         ['will-change', String(d.wcCount), d.wcCount > 2 ? 'warn' : 'ok'],
         ['动画背景', d.bgAnim ? '存在' : '无', d.bgAnim ? 'warn' : 'ok'],
@@ -1305,6 +1352,9 @@ function renderDiagnostics() {
     if (d.nativeTrunc && (d.chatLen || 0) > 300) tips.push('想让长聊天彻底顺滑：可在 ST「用户设置→聊天截断」设为 0 后交给虚拟化，或反向保持在 100 条更省');
     if (!d.nativeTrunc && (d.chatLen || 0) > 300 && !s.virtualize) tips.push('聊天截断为「不限」且消息很多，建议开启虚拟化或把 ST 聊天截断设成 100–200');
     if (d.input.max > 100) tips.push(`输入延迟最大 ${Math.round(d.input.max)}ms：按键被主线程计算挡住（世界书扫描/正则/向量检索/tokenizer），不是输入框本身问题`);
+    if (d.fadeIn && !s.streamFadeSkip) tips.push('「流式淡入」每个 tick 都要把整条消息按词重切 span 再 morphdom，长消息会明显卡；可开「生成时临时关闭流式淡入」或在 ST 里关掉');
+    if (!d.fastUi && d.blurCount > 0) tips.push('ST 自带「快速 UI 模式」能一键去掉全界面毛玻璃（比逐项关更彻底），在 ST 用户设置里开启即可');
+    if (d.regexCount > 5) tips.push(`已启用 ${d.regexCount} 条正则脚本，每条消息渲染都要全跑一遍；不常用的先在「正则」扩展里停用`);
     if (d.tokenCounter) tips.push('ST「显示每条消息 token」：消息落地和滑动时会分词一次，长聊天批量生成/大量滑动会加慢；不需要可在 ST 用户设置里关掉');
     if (d.renderMs > 120) tips.push(`消息落地约 ${Math.round(d.renderMs)}ms（事件到稳定一帧，含其它扩展的收尾处理），先查是否开了逐条 token 计数/TTS/总结类扩展`);
     if (!d.nativeTrunc && (d.chatLen || 0) > 500) tips.push('消息超过 500 条且聊天截断为「不限」：最有效的是「借用 ST 原生分页」设成 150–300，比折叠更原生');
@@ -1701,14 +1751,14 @@ function registerEvents() {
             scheduleSweep();
         }));
     });
-    on('MESSAGE_RECEIVED', () => { measureRender(); scheduleSweep(); });
-    on('MESSAGE_SENT', () => { measureRender(); scheduleSweep(); });
+    on('MESSAGE_RECEIVED', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
+    on('MESSAGE_SENT', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
     on('MESSAGE_EDITED', scheduleSweep);
     on('MESSAGE_UPDATED', scheduleSweep);
     on('MESSAGE_SWIPED', scheduleSweep);
     on('MESSAGE_DELETED', scheduleSweep);
     on('USER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); });
-    on('CHARACTER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); });
+    on('CHARACTER_MESSAGE_RENDERED', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
     on('MORE_MESSAGES_LOADED', () => { scheduleSweep(); scheduleMeasureCvSize(); });
     on('STREAM_TOKEN_RECEIVED', () => { state.tokens++; });
     on('GENERATION_STARTED', () => {
@@ -1719,6 +1769,8 @@ function registerEvents() {
         pauseObserver();
         if (state.s && isOn() && state.s.genLite) document.body.classList.add('antilag-gen');
         else document.body.classList.remove('antilag-gen');
+        applyStreamFadeSkip();
+        applyHotZone();
     });
     const endGen = () => {
         state.generating = false;
@@ -1729,6 +1781,7 @@ function registerEvents() {
         }
         state.genT0 = 0;
         document.body.classList.remove('antilag-gen');
+        restoreStreamFadeSkip();
         observeChat();
         scheduleSweep();
         if (state.panelEl) renderDiagnostics();
@@ -1743,6 +1796,7 @@ function init() {
         // 上次会话留下过流式降频 / 原生分页记录：先还原 ST 原值，再按当前开关决定是否重新套用
         if (state.s.streamFpsOrig) restoreStreamFps();
         if (state.s.truncApplied) restoreNativeLimit();
+        if (state.s.fadeApplied) restoreStreamFadeSkip();
         applyAll();
         mountUi();
         observeChat();
@@ -1776,6 +1830,7 @@ export function onDisable() {
     if (!state.s) return Promise.resolve();
     restoreStreamFps();
     restoreNativeLimit();
+    restoreStreamFadeSkip();
     state.s.enabled = false;
     applyAll();
     return Promise.resolve();
@@ -1803,6 +1858,7 @@ export function onEnable() {
 export function onCleanUp() {
     try { restoreStreamFps(); } catch (err) { /* 忽略 */ }
     try { restoreNativeLimit(); } catch (err) { /* 忽略 */ }
+    try { restoreStreamFadeSkip(); } catch (err) { /* 忽略 */ }
     ['antilag', 'antilag-virt', 'antilag-contain', 'antilag-gen', 'antilag-scrolling']
         .forEach((cls) => document.body && document.body.classList.remove(cls));
     if (document.documentElement) document.documentElement.classList.remove('antilag');
