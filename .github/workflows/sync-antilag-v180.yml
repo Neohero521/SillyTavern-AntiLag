@@ -1,0 +1,48 @@
+name: Sync AntiLag v1.8.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sync-antilag-v180.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch release package from CDN
+        run: |
+          set -e
+          curl -L --retry 6 --retry-delay 3 --retry-all-errors \
+            -o /tmp/antilag.zip https://aka.doubaocdn.com/s/jza3sVSg6e
+          unzip -o /tmp/antilag.zip -d /tmp/antilag
+          ls -la /tmp/antilag/antilag
+          cp /tmp/antilag/antilag/manifest.json .
+          cp /tmp/antilag/antilag/index.js .
+          cp /tmp/antilag/antilag/style.css .
+          cp /tmp/antilag/antilag/README.md .
+
+      - name: Commit release files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add manifest.json index.js style.css README.md
+          if git diff --cached --quiet; then
+            echo "No release changes to commit"
+          else
+            git commit -m "chore: release v1.8.0"
+            git push origin HEAD:main
+          fi
+
+      - name: Remove one-time workflow
+        run: |
+          git rm .github/workflows/sync-antilag-v180.yml
+          git commit -m "chore: remove one-time v1.8.0 sync workflow"
+          git push origin HEAD:main
