@@ -1217,6 +1217,7 @@ function updateBadge() {
 function resetSettings() {
     restoreStreamFps();
     restoreNativeLimit();
+    restoreStreamFadeSkip();
     state.s = JSON.parse(JSON.stringify(DEFAULTS));
     settingsStore()[MODULE_NAME] = state.s;
     save();
