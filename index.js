@@ -1,5 +1,5 @@
 /**
- * AntiLag 流畅优化 v1.4 —— SillyTavern 扩展
+ * AntiLag 流畅优化 v1.5 —— SillyTavern 扩展
  *
  * 设计原则：
  * 1) 默认「轻度」模式视觉零改动，只做不改变观感的减负；
@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -36,6 +36,9 @@ const MODE_LABEL = { lite: '轻度', standard: '均衡', turbo: '极速' };
 /** 极速模式（含自动降级）会额外拉起的纯视觉项 */
 const BOOST_KEYS = ['virtualize', 'killBlur', 'killBgAnim', 'killShadow', 'killTransitions', 'willChange', 'containChat'];
 const VISUAL_KEYS = Object.keys(PRESETS.turbo);
+
+/** 会随每条消息/每次生成触发额外工作的内置扩展（extension_settings 的键名） */
+const HEAVY_EXTS = ['expressions', 'vectors', 'caption', 'translate', 'tts', 'memory', 'quickReply', 'sd', 'regex'];
 
 const DEFAULTS = {
     enabled: true,
@@ -162,6 +165,8 @@ const state = {
     eventsBound: false,
     lastRenderMs: 0,
     renderT0: 0,
+    clipSig: '',
+    clipDirty: true,
 };
 
 /* ------------------------------------------------------------------ */
@@ -841,11 +846,20 @@ function applyClip() {
     if (!isOn() || !state.s.clipLong) {
         chat.querySelectorAll('.mes.al-clip').forEach((el) => el.classList.remove('al-clip'));
         chat.querySelectorAll('.al-clip-btn').forEach((el) => el.remove());
+        state.clipSig = '';
+        state.clipDirty = true;
         return;
     }
     if (state.s.pauseOnEdit && isBusy()) return;
 
     const limit = state.s.clipChars;
+    const mesList = chat.querySelectorAll('.mes');
+    const lastId = mesList.length ? (mesList[mesList.length - 1].dataset.mesid || '') : '';
+    const sig = `${mesList.length}|${lastId}|${limit}`;
+    // 未折叠消息的全量文本扫描是 O(总字数)：只在消息增减/阈值变化/编辑滑动后重扫，
+    // 其余时候只复核已有的折叠项（很小的一批）
+    const fullScan = state.clipDirty || state.clipSig !== sig;
+
     withChatScroll(() => {
         // 内容已变短（换 swipe / 编辑）的旧折叠先还原
         chat.querySelectorAll('.mes.al-clip').forEach((mes) => {
@@ -856,6 +870,8 @@ function applyClip() {
                 if (btn) btn.remove();
             }
         });
+
+        if (!fullScan) return;
 
         chat.querySelectorAll('.mes:not(.al-clip)').forEach((mes) => {
             if (mes.querySelector('.al-clip-btn')) return;
@@ -875,6 +891,9 @@ function applyClip() {
             mes.appendChild(btn);
         });
     });
+
+    state.clipSig = sig;
+    state.clipDirty = false;
 }
 
 const scheduleSweep = (() => {
@@ -1240,7 +1259,17 @@ function collectDiagnostics() {
     const c = ctx();
     const chatLen = c && Array.isArray(c.chat) ? c.chat.length : 0;
     const mesDom = document.querySelectorAll('#chat .mes').length;
-    const nodes = document.querySelectorAll('*').length;
+    // 全文档节点数用 live collection，避免在超大 DOM 上分配一个包含所有节点的数组
+    let nodes = 0;
+    try {
+        nodes = document.getElementsByTagName('*').length;
+    } catch (err) {
+        nodes = document.querySelectorAll('*').length;
+    }
+    const disabledExts = Array.isArray(c && c.extensionSettings && c.extensionSettings.disabledExtensions)
+        ? c.extensionSettings.disabledExtensions : [];
+    const heavy = HEAVY_EXTS.filter((k) => c && c.extensionSettings
+        && Boolean(c.extensionSettings[k]) && !disabledExts.includes(k));
     const extCount = c && c.extensionSettings
         ? Object.keys(c.extensionSettings).filter((k) => k !== MODULE_NAME).length
         : 0;
@@ -1292,6 +1321,7 @@ function collectDiagnostics() {
         fastUi: Boolean(pu.fast_ui_mode),
         regexCount: Array.isArray(c && c.extensionSettings && c.extensionSettings.regex)
             ? c.extensionSettings.regex.length : 0,
+        heavy,
         renderMs: state.lastRenderMs,
     };
 }
@@ -1330,6 +1360,7 @@ function renderDiagnostics() {
         ['最长消息', d.longest > 5000 ? `${Math.round(d.longest / 1000)}k 字` : `${d.longest} 字`, d.longest > 5000 ? 'warn' : 'ok'],
         ['聊天图片', String(d.imgCount), 'ok'],
         ['已启用扩展', String(d.extCount), d.extCount > 10 ? 'warn' : 'ok'],
+        ['重型扩展', d.heavy.length ? d.heavy.join(' / ') : '无', d.heavy.length >= 3 ? 'warn' : 'ok'],
     ];
 
     grid.innerHTML = items.map(([k, v, level]) => `
@@ -1361,6 +1392,7 @@ function renderDiagnostics() {
     if (!d.nativeTrunc && (d.chatLen || 0) > 500) tips.push('消息超过 500 条且聊天截断为「不限」：最有效的是「借用 ST 原生分页」设成 150–300，比折叠更原生');
     if (d.loadMs > 800) tips.push(`上次打开聊天耗时 ${Math.round(d.loadMs)}ms（${d.loadCount} 条），可调低聊天截断或开虚拟化改善后续滚动`);
     if (d.extCount > 10) tips.push(`已启用 ${d.extCount} 个扩展，建议逐个停用排查（尤其自带定时器的）`);
+    if (d.heavy.length >= 2) tips.push(`已启用 ${d.heavy.join('、')}：它们会随每条消息或每次生成额外触发工作（表情分类/TTS/翻译/记忆摘要/向量检索/正则）；卡顿时先停用不用的`);
     if (isEditing()) tips.push('正在编辑消息，结构性优化已自动暂缓');
     if (!tips.length) tips.push('当前状态良好，保持现有配置即可');
 
@@ -1754,9 +1786,9 @@ function registerEvents() {
     });
     on('MESSAGE_RECEIVED', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
     on('MESSAGE_SENT', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
-    on('MESSAGE_EDITED', scheduleSweep);
-    on('MESSAGE_UPDATED', scheduleSweep);
-    on('MESSAGE_SWIPED', scheduleSweep);
+    on('MESSAGE_EDITED', () => { state.clipDirty = true; scheduleSweep(); });
+    on('MESSAGE_UPDATED', () => { state.clipDirty = true; scheduleSweep(); });
+    on('MESSAGE_SWIPED', () => { state.clipDirty = true; scheduleSweep(); });
     on('MESSAGE_DELETED', scheduleSweep);
     on('USER_MESSAGE_RENDERED', () => { measureRender(); scheduleSweep(); });
     on('CHARACTER_MESSAGE_RENDERED', () => { measureRender(); hotZoneTick(); scheduleSweep(); });

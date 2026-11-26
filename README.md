@@ -64,6 +64,24 @@
 
 ---
 
+## v1.5 做了什么：第四轮核查（把「归因」做准，把自身开销压下去）
+
+第四轮盯的是两件事：体检会不会误判、以及这个扩展自己在长聊天里有没有偷偷变贵。
+
+| 在 ST 1.19.1 源码里查到的事实 | 意味着什么 | v1.5 的应对 |
+| --- | --- | --- |
+| 扩展的启停真相是 `extension_settings.disabledExtensions` 数组，`isEnabled` 判断都走它 | 只按「设置里有没有这个键」统计，会把装了但停用的扩展算成负担，归因会错 | 体检按 `disabledExtensions` 过滤，新增「重型扩展」行：`expressions / vectors / caption / translate / tts / memory / quickReply / sd / regex`，并给出「随消息或生成触发额外工作」的建议 |
+| `scrollChatToBottom` 在流式每个 tick 都读一次 `chatElement[0].scrollHeight`（`waitForFrame` 下按帧节流） | 最后一条消息必须真实参与布局，否则 `scrollHeight` 只能按估高算，滚动会抖 | 保留并强化 v1.4 规则：生成期 `.mes:last-child` 强制 `content-visibility: visible`，消息落地事件补热区标记 |
+| `saveChatDebounced` 是 debounce + `saveChatConditional`，不在每个 token 上序列化整份 chat | 生成期的卡不是存档造成的；关自动保存只会丢数据 | 不提供「关闭自动保存」这类危险开关，README 明确说明 |
+| `appendMediaToMessage` 只挂 DOM，1.19.1 没有给聊天媒体加 `autoplay` | 不需要为视频/音频自动播放额外做处理 | 维持只对 `.mes_block img/iframe` 做懒加载 |
+| `getChat` 没有渐进式首屏加载，`showMoreMessages` 的 `messagesToLoad` 只是可选入参 | 打开聊天就是一次性渲染 N 条，首屏耗时全在主线程 | 「上次加载」指标依然准确；控制首屏条数仍靠 ST 原生分页 |
+| 我们自己的「超长消息折叠」每次都要读所有未折叠消息的全文来判断长度 | 消息多且长时，光是判断就接近 O(总字数)，属于扩展自带的隐形开销 | 改为「签名 + dirty 标记」：只有消息增减、阈值变化、编辑/滑动后才全量扫；平时只复核已折叠的少量消息 |
+| 体检里的节点数原来用 `document.querySelectorAll('*')` | 在超大 DOM 上会分配一个包含所有节点的数组，体检本身可能卡一下 | 改用 `getElementsByTagName('*')` 的 live length，不产生数组 |
+
+另外，这一轮也确认了几个「看起来该改、其实不该碰」的点：存档、媒体自动播放、首屏加载都不在我们的可安全干预范围内，硬改只会带来数据或体验风险，所以只做归因与提示。
+
+---
+
 ## 设计原则：先不打扰，再谈优化
 
 1. **默认「轻度」档视觉零改动**：只做不可见的减负（虚拟化、懒加载、生成隔离、清理 will-change、滚动期降载）。
@@ -127,7 +145,7 @@
 - **借用 ST 原生分页**（新）：把 ST 自己的「聊天截断」设成 100/150/300 条，只渲染最近 N 条、顶部「Show more」可翻回；改的是 ST 原生显示设置，可还原，且不改变发给模型的上文。
 - **历史管理**：折叠较早消息（默认关）；检测到 ST 原生分页时自动跳过；顶部「展开」随时还原，不删数据。
 - **超长消息折叠**：单条超过阈值（默认 3000 字）先显示前段，点「展开全文」。
-- **体检与归因**：帧率、消息条数、**实际渲染条数/虚拟化状态**、**原生截断（含是否分页中）**、**上次加载耗时**、**消息落地耗时**、**输入延迟（10s 最大）**、**生成期长任务 + TPS**、**ST 流式 FPS**、**流式淡入状态**、**ST 快速 UI 状态**、**正则脚本数**、**ST 逐条 token 计数状态**、DOM 节点、毛玻璃元素、will-change、动画背景、最长消息、图片数、扩展数，并按红黄项给建议。
+- **体检与归因**：帧率、消息条数、**实际渲染条数/虚拟化状态**、**原生截断（含是否分页中）**、**上次加载耗时**、**消息落地耗时**、**输入延迟（10s 最大）**、**生成期长任务 + TPS**、**ST 流式 FPS**、**流式淡入状态**、**ST 快速 UI 状态**、**正则脚本数**、**重型扩展**、**ST 逐条 token 计数状态**、DOM 节点、毛玻璃元素、will-change、动画背景、最长消息、图片数、扩展数，并按红黄项给建议。
 - **自动降级**：连续 3 秒低于阈值（默认 28 FPS）→ 临时升级到「极速视觉」（不折叠内容），恢复 12 秒后自动退出，不写设置。
 - **悬浮仪表**：右下角可拖动小球，显示实时 FPS，轻点展开详情（模式、长任务、消息数 + 三档快捷切换）。
 
@@ -214,6 +232,7 @@ https://github.com/Neohero521/SillyTavern-AntiLag
 | 流式淡入 | ST 的 `stream_fade_in` | 开着且长消息卡 → 开「生成时临时关闭」或直接在 ST 里关 |
 | ST 快速 UI | `fast_ui_mode` / `body.no-blur` | 开着说明毛玻璃已全局去掉，本扩展的毛玻璃开关不会再有额外变化 |
 | 正则脚本 | `extension_settings.regex` 条数 | >5 条且单条消息渲染慢 → 精简不常用的脚本 |
+| 重型扩展 | 按 `disabledExtensions` 过滤后的 expressions/vectors/caption/translate/tts/memory/quickReply/sd/regex | 同时开 2 个以上且卡 → 先停用不用的，它们会随消息/生成额外触发 |
 | 毛玻璃元素 | 抽样 30 条消息中含 `backdrop-filter`/`filter` 的数量 | 大于 0 就值得关掉 |
 | will-change | 抽样消息里非 auto 的 will-change 数量 | >2 说明主题在滥用 |
 | 动画背景 | 背景是否在动或 fixed | 是则滚动必掉帧 |
@@ -260,6 +279,7 @@ antilag/
 
 ## 版本
 
+- **v1.5.0**：第四轮核查——体检按 `disabledExtensions` 真实启停归因，新增「重型扩展」；确认存档/媒体/首屏加载不属可安全干预范围（只归因不改）；「超长消息折叠」改为签名 + dirty 标记，避免长聊天里每次全量扫文本；节点统计改用 live collection。
 - **v1.4.0**：第三轮源码核查（release 1.19.1）——新增「生成时临时关闭流式淡入」（`stream_fade_in` 每 tick 的 Segmenter + morphdom 是当前最贵的单项，可记录/还原）；生成期最后一条强制 `content-visibility: visible` 并补热区标记；体检新增「流式淡入 / ST 快速 UI / 正则脚本」并修正提示；确认 1.19.1 的 `smooth_streaming` 仍无消费点。
 - **v1.3.0**：第二轮源码核查——原生分页与虚拟化互斥（`show_more_messages` 存在即不虚拟化/不折叠）；新增「借用 ST 原生分页」并记录/还原原值（用户改过则尊重用户）；懒加载限定 `.mes_block img/iframe`，头像不再被懒加载；sweep 改 300ms 去抖 + `requestIdleCallback`；体检新增「消息落地 / ST 逐条 token 计数 / 分页中」；HUD 监听 `visualViewport` 防被键盘顶出屏幕。
 - **v1.2.0**：源码级对齐（`#chat` 本体毛玻璃与阴影、输入条毛玻璃、原生 `chat_truncation` 协同、`childList` 观察器）；虚拟化热区 + 实测 `contain-intrinsic-size`；滚动期降载；流式降频（可还原）；输入延迟 / 加载耗时 / TPS / 原生截断体检；`manifest.hooks` 生命周期；推理块编辑识别。
