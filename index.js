@@ -1,5 +1,5 @@
 /**
- * AntiLag 流畅优化 v1.6 —— SillyTavern 扩展
+ * AntiLag 流畅优化 v1.6.1 —— SillyTavern 扩展
  *
  * 设计原则：
  * 1) 默认「轻度」模式视觉零改动，只做不改变观感的减负；
@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.6.0';
+const VERSION = '1.6.1';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -63,6 +63,7 @@ const DEFAULTS = {
     nativeLimit: 0,
     truncApplied: false,
     truncOrig: 0,
+    truncAppliedValue: 0,
     clipLong: false,
     clipChars: 3000,
 
@@ -103,6 +104,7 @@ const TOGGLES = [
     ['al-contain', 'containChat'],
     ['al-trim', 'trimHistory'],
     ['al-clip', 'clipLong'],
+    ['al-scrollidle', 'scrollIdle'],
     ['al-scrollblur', 'scrollBlur'],
     ['al-notify', 'notify'],
 ];
@@ -151,8 +153,10 @@ const state = {
     mesCount: 0,
     applyQueued: false,
     nativeTrunc: 0,
+    nativeChanged: false,
     cvSize: 0,
     chatLoadT0: 0,
+    chatLoadTimer: 0,
     chatLoadMs: 0,
     chatLoadCount: 0,
     inputEvents: [],
@@ -163,6 +167,11 @@ const state = {
     tps: 0,
     lastTps: 0,
     eventsBound: false,
+    eventBindings: [],
+    eventSource: null,
+    scrollHandler: null,
+    scrollTarget: null,
+    disposed: false,
     lastRenderMs: 0,
     renderT0: 0,
     clipSig: '',
@@ -312,9 +321,16 @@ function applyNativeLimit() {
     if (!state.s.truncApplied) {
         state.s.truncOrig = pu.chat_truncation;
         state.s.truncApplied = true;
+        state.s.truncAppliedValue = want;
+        save();
+    } else if (state.s.truncAppliedValue !== want) {
+        state.s.truncAppliedValue = want;
         save();
     }
-    if (pu.chat_truncation !== want) pu.chat_truncation = want;
+    if (pu.chat_truncation !== want) {
+        pu.chat_truncation = want;
+        state.nativeChanged = true;
+    }
     return want;
 }
 
@@ -356,23 +372,36 @@ function rerenderChatSoon() {
     if (rerenderTimer) return;
     rerenderTimer = setTimeout(() => {
         rerenderTimer = 0;
-        if (!isOn() || state.generating || state.chatLoading) return;
+        if (state.disposed || !isOn() || state.generating || state.chatLoading) return;
+        // 马上要整体重渲染：让折叠/裁剪在渲染后重新判定
+        state.trimSig = '';
+        state.clipDirty = true;
         const c = ctx();
         if (!c || typeof c.printMessages !== 'function') return;
         if (!Array.isArray(c.chat) || !c.chat.length) return;
-        Promise.resolve(c.printMessages()).catch((err) => console.warn('[AntiLag] 重新渲染失败', err));
+        Promise.resolve().then(() => c.printMessages()).then(() => {
+            // printMessages 是 async，渲染完成后重算一次虚拟化门控/折叠条件
+            if (!state.disposed) applyAll();
+        }).catch((err) => console.warn('[AntiLag] 重新渲染失败', err));
     }, 400);
 }
 
 function restoreNativeLimit() {
     const pu = powerUser();
     if (!pu || !state.s || !state.s.truncApplied) return;
-    const applied = Number(state.s.nativeLimit) || 0;
+    // 必须用「实际写进 ST 的值」判断，不能用当前选择值：用户把下拉改回「不改(0)」时，
+    // nativeLimit 已经是 0，若拿 0 去比对就永远不会还原。
+    const applied = Number(state.s.truncAppliedValue) || Number(state.s.nativeLimit) || 0;
     // 只在「当前值仍是我们改的那个」时才还原，用户在 ST 里自己改过就尊重用户
     if (applied && Number(pu.chat_truncation) === applied) {
-        pu.chat_truncation = Number(state.s.truncOrig) || 0;
+        const orig = Number(state.s.truncOrig) || 0;
+        if (pu.chat_truncation !== orig) {
+            pu.chat_truncation = orig;
+            state.nativeChanged = true;
+        }
     }
     state.s.truncApplied = false;
+    state.s.truncAppliedValue = 0;
     save();
 }
 
@@ -397,6 +426,8 @@ function loadSettings() {
     s.nativeLimit = [0, 100, 150, 300].includes(Number(s.nativeLimit)) ? Number(s.nativeLimit) : 0;
     s.truncOrig = clamp(parseInt(s.truncOrig, 10) || 0, 0, 5000);
     s.truncApplied = Boolean(s.truncApplied);
+    // 兼容 v1.6.0 旧数据：没有记录「我们写进去的值」时回落到 nativeLimit
+    s.truncAppliedValue = clamp(parseInt(s.truncAppliedValue, 10) || (s.truncApplied ? s.nativeLimit : 0), 0, 5000);
     if (!PRESETS[s.mode] && s.mode !== 'custom') s.mode = DEFAULTS.mode;
 
     // 过期暂停自动清除
@@ -544,10 +575,12 @@ function swapStyle(css) {
     if (style.textContent === css) return;
     const chat = chatEl();
     const top = chat ? chat.scrollTop : null;
+    const atBottom = chat ? (top + (chat.clientHeight || 0) >= (chat.scrollHeight || 0) - 8) : false;
     style.textContent = css;
     if (chat && top !== null && state.s.preserveScroll) {
-        // 只在发生明显位移时回填，避免无谓的同步布局
-        if (Math.abs(chat.scrollTop - top) > 1) chat.scrollTop = top;
+        // 贴底时保持贴底（虚拟化/contain 会改变 scrollHeight），否则只回填明显位移
+        if (atBottom) chat.scrollTop = chat.scrollHeight || 0;
+        else if (Math.abs(chat.scrollTop - top) > 1) chat.scrollTop = top;
     }
 }
 
@@ -606,6 +639,7 @@ function applyHotZone() {
  * content-visibility 的元素未渲染时用估高，估高偏差会表现为滚动条跳动，所以取真实样本。
  */
 function measureCvSize() {
+    if (state.disposed) return;
     const chat = chatEl();
     if (!chat) return;
     // 只量热区（永不虚拟化）的真实高度：虚拟化元素返回的是估高，用它算中位数会自我循环
@@ -640,19 +674,23 @@ function setCvSize(value) {
 }
 
 function scheduleMeasureCvSize() {
-    if (!state.s || !isOn()) return;
+    if (state.disposed || !state.s || !isOn()) return;
     requestAnimationFrame(() => {
+        if (state.disposed) return;
         measureCvSize();
-        if (!state.cvSize) setTimeout(measureCvSize, 300);
+        if (!state.cvSize) setTimeout(() => { if (!state.disposed) measureCvSize(); }, 300);
     });
 }
 
 /** 滚动期降载：滚动中屏蔽按钮命中测试与过渡，停止 160ms 后自动恢复 */
 function hookScrollIdle() {
     const chat = chatEl();
-    if (!chat || chat.dataset.alScrolled === '1') return;
-    chat.dataset.alScrolled = '1';
-    chat.addEventListener('scroll', () => {
+    if (!chat) return;
+    if (state.scrollHandler && state.scrollTarget === chat) return;
+    if (state.scrollHandler && state.scrollTarget) {
+        state.scrollTarget.removeEventListener('scroll', state.scrollHandler);
+    }
+    const handler = () => {
         if (!state.s || !isOn() || (!state.s.scrollIdle && !state.s.scrollBlur)) return;
         if (!document.body.classList.contains('antilag-scrolling')) {
             document.body.classList.add('antilag-scrolling');
@@ -661,7 +699,10 @@ function hookScrollIdle() {
         state.scrollTimer = setTimeout(() => {
             document.body.classList.remove('antilag-scrolling');
         }, 160);
-    }, { passive: true });
+    };
+    state.scrollHandler = handler;
+    state.scrollTarget = chat;
+    chat.addEventListener('scroll', handler, { passive: true });
 }
 
 /**
@@ -683,7 +724,11 @@ function targetStreamFps() {
         save();
     }
     const target = Math.min(state.s.streamFpsOrig, cap);
-    state.s.streamFpsApplied = target;
+    // 必须持久化「我们写进去的值」：否则页面刷新/崩溃后无法判断当前值是不是我们改的，原值会丢
+    if (state.s.streamFpsApplied !== target) {
+        state.s.streamFpsApplied = target;
+        save();
+    }
     if (pu.streaming_fps !== target) pu.streaming_fps = target;
     return target;
 }
@@ -744,7 +789,7 @@ function measureRender() {
 /* ------------------------------------------------------------------ */
 
 function applyAll() {
-    if (!state.s || !document.body) return;
+    if (state.disposed || !state.s || !document.body) return;
     state.applyQueued = false;
 
     const on = isOn();
@@ -776,6 +821,11 @@ function applyAll() {
         restoreNativeLimit();
         restoreStreamFadeSkip();
     }
+    if (on && state.nativeChanged && !state.generating && !state.chatLoading) {
+        // 生成中/加载中先留着标记，结束后再统一重渲染
+        state.nativeChanged = false;
+        rerenderChatSoon();
+    }
     if (!on) {
         clearStructural();
     } else {
@@ -805,38 +855,58 @@ function clearStructural() {
     chat.querySelectorAll('.mes.al-trim').forEach((el) => el.classList.remove('al-trim'));
     chat.querySelectorAll('.mes.al-clip').forEach((el) => el.classList.remove('al-clip'));
     chat.querySelectorAll('.al-clip-btn').forEach((el) => el.remove());
+    chat.querySelectorAll('.mes[data-al-expanded]').forEach((el) => { delete el.dataset.alExpanded; });
     chat.querySelectorAll('.mes.al-hot').forEach((el) => el.classList.remove('al-hot'));
     state.hotTotal = 0;
+    // 关闭/卸载后不留签名，重新启用时要重新做一次全量判定
+    state.trimSig = 'off';
+    state.trimExpanded = false;
+    state.clipSig = '';
+    state.clipDirty = true;
 }
 
 /** 撤销我们自己加在媒体上的懒加载属性；原本就有 loading/decoding 的不动 */
+function cleanupMedia(el) {
+    if (el.dataset.alLoading === '1') el.removeAttribute('loading');
+    if (el.dataset.alDecoding === '1') el.removeAttribute('decoding');
+    el.classList.remove('al-lazy');
+    delete el.dataset.alLazy;
+    delete el.dataset.alLoading;
+    delete el.dataset.alDecoding;
+}
+
+function clearLazy(selector) {
+    document.querySelectorAll(selector).forEach(cleanupMedia);
+}
+
 function clearImages() {
-    document.querySelectorAll('#chat [data-al-lazy]').forEach((el) => {
-        if (el.dataset.alLoading === '1') el.removeAttribute('loading');
-        if (el.dataset.alDecoding === '1') el.removeAttribute('decoding');
-        el.classList.remove('al-lazy');
-        delete el.dataset.alLazy;
-        delete el.dataset.alLoading;
-        delete el.dataset.alDecoding;
-    });
+    clearLazy('#chat [data-al-lazy]');
 }
 
 function applyImages() {
-    if (!eff('lazyImg')) { clearImages(); return; }
+    // 暂停/禁用时扫描仍可能被其它事件触发，这里必须一起收掉，避免「暂停了还在加属性」
+    if (!isOn()) { clearImages(); return; }
+    const wantImg = eff('lazyImg');
+    const wantFrame = eff('lazyFrame');
+    // 两个开关独立：关图片不能顺手把 iframe 的懒加载也撤掉（v1.6.1 修正）
+    if (!wantImg) clearLazy('#chat .mes_block img[data-al-lazy]');
+    if (!wantFrame) clearLazy('#chat .mes_block iframe[data-al-lazy]');
     // 只处理消息正文里的图（含媒体块）：头像同 URL 且尺寸小，懒加载反而会在滚动时闪加载
-    document.querySelectorAll('#chat .mes_block img:not([data-al-lazy])').forEach((img) => {
-        img.dataset.alLazy = '1';
-        img.classList.add('al-lazy');
-        if (!img.hasAttribute('loading')) {
-            img.setAttribute('loading', 'lazy');
-            img.dataset.alLoading = '1';
-        }
-        if (!img.hasAttribute('decoding')) {
-            img.setAttribute('decoding', 'async');
-            img.dataset.alDecoding = '1';
-        }
-    });
-    if (eff('lazyFrame')) {
+    if (wantImg) {
+        document.querySelectorAll('#chat .mes_block img:not([data-al-lazy])').forEach((img) => {
+            img.dataset.alLazy = '1';
+            img.classList.add('al-lazy');
+            if (!img.hasAttribute('loading')) {
+                img.setAttribute('loading', 'lazy');
+                img.dataset.alLoading = '1';
+            }
+            if (!img.hasAttribute('decoding')) {
+                img.setAttribute('decoding', 'async');
+                img.dataset.alDecoding = '1';
+            }
+        });
+    }
+    if (wantFrame) {
         document.querySelectorAll('#chat .mes_block iframe:not([data-al-lazy])').forEach((frame) => {
             frame.dataset.alLazy = '1';
             if (!frame.hasAttribute('loading')) {
@@ -868,7 +938,9 @@ function applyTrim() {
 
     const s = state.s;
     // ST 原生已有分页（chat_truncation + Show more messages）时不再叠一层折叠，避免两套历史机制互相打架
-    const nativePaging = Boolean(document.getElementById('show_more_messages'));
+    // 只要 ST 的「聊天截断」>0，或页面上有 Show more，就不再叠折叠：
+    // 原生分页已经只渲染最近 N 条，再折叠会把用户刚点「Show more」加载出来的历史又藏回去
+    const nativePaging = Boolean(document.getElementById('show_more_messages')) || nativeTruncation() > 0;
     const active = Boolean(isOn() && s.trimHistory && !state.trimExpanded && !nativePaging);
     const keep = s.trimKeep;
 
@@ -926,9 +998,10 @@ function applyClip() {
     if (!chat) return;
     if (!isOn() || !state.s.clipLong) {
         // 关掉时只在确实有残留折叠时才清理，避免每次扫描都全量 query
-        if (chat.querySelector('.mes.al-clip, .al-clip-btn')) {
+        if (chat.querySelector('.mes.al-clip, .al-clip-btn, .mes[data-al-expanded]')) {
             chat.querySelectorAll('.mes.al-clip').forEach((el) => el.classList.remove('al-clip'));
             chat.querySelectorAll('.al-clip-btn').forEach((el) => el.remove());
+            chat.querySelectorAll('.mes[data-al-expanded]').forEach((el) => { delete el.dataset.alExpanded; });
         }
         state.clipSig = '';
         state.clipDirty = true;
@@ -958,7 +1031,8 @@ function applyClip() {
         if (!fullScan) return;
 
         chat.querySelectorAll('.mes:not(.al-clip)').forEach((mes) => {
-            if (mes.querySelector('.al-clip-btn')) return;
+            // 用户点过「展开全文」的消息不再自动折叠（新消息追加/整体重扫时也尊重这次展开）
+            if (mes.dataset.alExpanded === '1' || mes.querySelector('.al-clip-btn')) return;
             const text = mes.querySelector('.mes_text');
             if (!text) return;
             const len = (text.textContent || '').length;
@@ -969,6 +1043,7 @@ function applyClip() {
             btn.className = 'al-clip-btn';
             btn.textContent = `展开全文（${len} 字）`;
             btn.addEventListener('click', () => {
+                mes.dataset.alExpanded = '1';
                 mes.classList.remove('al-clip');
                 btn.remove();
             });
@@ -984,7 +1059,7 @@ function applyClip() {
 const scheduleSweep = (() => {
     let timer = 0;
     const run = () => {
-        if (document.hidden || !state.s) return;
+        if (state.disposed || document.hidden || !state.s) return;
         if (state.generating) return; // 生成中不打扰
         try {
             refreshVirtGate();
@@ -1017,7 +1092,11 @@ const scheduleSweep = (() => {
 function applyPreset(mode) {
     const preset = PRESETS[mode];
     if (!preset || !state.s) return;
+    state.boost = false;
+    state.lowStreak = 0;
+    state.highStreak = 0;
     VISUAL_KEYS.forEach((k) => { state.s[k] = preset[k]; });
+    if (!preset.killBlur) state.s.killBlurAll = false;
     if (mode === 'turbo' && state.s.trimKeep > 160) state.s.trimKeep = 100;
     if (state.s.trimHistory) {
         state.trimExpanded = false;
@@ -1131,6 +1210,8 @@ function buildPanel() {
                 ${rowToggle('al-scrollidle', '滚动期降载', '滚动时暂时屏蔽消息按钮的 hover 与过渡，停止滚动立即恢复', 'scrollIdle')}
                 ${rowToggle('al-pause-on-edit', '编辑消息时暂停', '正在编辑/选中文本时不做折叠与裁剪，避免打断操作', 'pauseOnEdit')}
                 ${rowToggle('al-auto', '自动降级', '连续掉帧时临时升级到极速视觉，恢复后自动退出', 'autoDetect')}
+                ${rowNumber('al-fps', '掉帧阈值', '连续 3 秒低于该帧率才触发自动降级', s.fpsThreshold, 'FPS', 10, 60, 5)}
+                ${rowNumber('al-long', '长任务阈值', '体检里超过该时长的主线程任务标红', s.longTaskMs, 'ms', 50, 3000, 50)}
                 ${rowToggle('al-notify', '状态提示', '临时升级、暂停等动作弹出轻提示', 'notify')}
                 <div class="al-row">
                     <div class="al-row-text">
@@ -1157,7 +1238,7 @@ function buildPanel() {
                 ${rowToggle('al-lazyframe', 'iframe 懒加载', '消息里的网页/视频卡片延迟加载', 'lazyFrame')}
                 ${rowToggle('al-willchange', '清理 will-change', '回收被主题滥用的 GPU 图层，降低移动端内存压力', 'willChange')}
                 ${rowToggle('al-scrollblur', '滚动时临时关模糊', '滚动时每帧都要重新采样背景，低配机收益最大；停手 160ms 自动恢复（会有一瞬视觉跳变）', 'scrollBlur')}
-                ${rowToggle('al-killblur', '关闭毛玻璃 / 滤镜', 'backdrop-filter 是掉帧第一大户；ST「快速 UI」开着时本项看不到变化（已被 ST 全局去掉）', 'killBlur')}
+                ${rowToggle('al-killblur', '关闭毛玻璃 / 滤镜', 'backdrop-filter 是掉帧第一大户；ST「快速 UI」开着时 Chrome 系已全局去掉，Safari 的 -webkit- 前缀仍可能需要本项', 'killBlur')}
                 ${rowToggle('al-killblur-all', '毛玻璃关闭范围：全界面', '默认只关聊天区，打开后连抽屉、顶栏、弹窗一起关', 'killBlurAll')}
                 ${rowToggle('al-killbg', '停用动画背景', '停掉背景动画与 fixed 背景，滚动更稳', 'killBgAnim')}
                 ${rowToggle('al-killshadow', '关闭阴影', '去掉消息的 box-shadow / text-shadow', 'killShadow')}
@@ -1210,7 +1291,21 @@ function bindPanel() {
         if (!input) return;
         input.addEventListener('change', () => {
             state.s[key] = input.checked;
+            // 全界面关闭依赖总开关；否则只开「全界面」不会有任何效果
+            if (key === 'killBlurAll' && input.checked) state.s.killBlur = true;
+            if (key === 'killBlur' && !input.checked) state.s.killBlurAll = false;
+            if (key === 'trimHistory' && input.checked) {
+                // 之前点过「展开」的话，重新打开折叠要重新折
+                state.trimExpanded = false;
+                state.trimSig = '';
+            }
             if (VISUAL_KEYS.includes(key)) state.s.mode = 'custom';
+            // 用户手动改视觉项时退出临时极速，否则 boost 会把它改回去，看起来像开关失灵
+            if (state.boost && (BOOST_KEYS.includes(key) || key === 'autoDetect' || (key === 'enabled' && !input.checked))) {
+                state.boost = false;
+                state.lowStreak = 0;
+                state.highStreak = 0;
+            }
             input.closest('.al-switch')?.classList.toggle('is-on', input.checked);
             save();
             applyAll();
@@ -1298,6 +1393,10 @@ function syncPanel() {
 }
 
 function togglePause() {
+    // 暂停/恢复都不应该把「临时极速」带过去
+    state.boost = false;
+    state.lowStreak = 0;
+    state.highStreak = 0;
     if (isPaused()) {
         state.s.pausedUntil = 0;
         toast('info', '已恢复 AntiLag');
@@ -1321,6 +1420,9 @@ function updateBadge() {
 }
 
 function resetSettings() {
+    state.boost = false;
+    state.lowStreak = 0;
+    state.highStreak = 0;
     restoreStreamFps();
     restoreNativeLimit();
     restoreStreamFadeSkip();
@@ -1420,7 +1522,7 @@ function collectDiagnostics() {
         fadeIn: Boolean(pu.stream_fade_in),
         fastUi: Boolean(pu.fast_ui_mode),
         regexCount: (!disabledExts.includes('regex') && Array.isArray(c && c.extensionSettings && c.extensionSettings.regex))
-            ? c.extensionSettings.regex.length : 0,
+            ? c.extensionSettings.regex.filter((r) => r && !r.disabled).length : 0,
         heavy,
         renderMs: state.lastRenderMs,
     };
@@ -1457,7 +1559,7 @@ function renderDiagnostics() {
         ['毛玻璃元素', String(d.blurCount), d.blurCount > 0 ? 'warn' : 'ok'],
         ['will-change', String(d.wcCount), d.wcCount > 2 ? 'warn' : 'ok'],
         ['动画背景', d.bgAnim ? '存在' : '无', d.bgAnim ? 'warn' : 'ok'],
-        ['最长消息', d.longest > 5000 ? `${Math.round(d.longest / 1000)}k 字` : `${d.longest} 字`, d.longest > 5000 ? 'warn' : 'ok'],
+        ['近期最长消息', d.longest > 5000 ? `${Math.round(d.longest / 1000)}k 字` : `${d.longest} 字`, d.longest > 5000 ? 'warn' : 'ok'],
         ['聊天图片', String(d.imgCount), 'ok'],
         ['已启用扩展', String(d.extCount), d.extCount > 10 ? 'warn' : 'ok'],
         ['重型扩展', d.heavy.length ? d.heavy.join(' / ') : '无', d.heavy.length >= 3 ? 'warn' : 'ok'],
@@ -1470,7 +1572,7 @@ function renderDiagnostics() {
 
     const tips = [];
     if ((d.chatLen || d.mesDom) > 300 && !s.virtualize) tips.push('长聊天建议开启「消息虚拟化」');
-    if (d.blurCount > 0 && !s.killBlur) tips.push('聊天区有毛玻璃/模糊，切「均衡」或单开「关闭毛玻璃」');
+    if (d.blurCount > 0 && !s.killBlur) tips.push('界面仍有毛玻璃/模糊：切「均衡」只关聊天区，要连顶栏/抽屉一起关再开「全界面」');
     if (d.bgAnim && !s.killBgAnim) tips.push('检测到动画背景，建议停用动画背景');
     if (d.wcCount > 2 && !s.willChange) tips.push('主题在滥用 will-change，建议开启「清理 will-change」');
     if (d.longest > 5000 && !s.clipLong) tips.push(`最长一条消息约 ${Math.round(d.longest / 1000)}k 字，可开「超长消息折叠」`);
@@ -1480,16 +1582,18 @@ function renderDiagnostics() {
     if (state.lastGenLt > 3 && d.stStreamFps >= 25 && !s.streamFps) {
         tips.push(`ST 流式刷新是 ${d.stStreamFps} FPS，每个 tick 都要重跑正则+净化+Markdown；可把「流式降频」设到 15–20`);
     }
-    if (d.nativeTrunc) tips.push(`ST 原生「聊天截断」为 ${d.nativeTrunc} 条，更早的消息本来就不渲染，无需再开「折叠较早消息」`);
-    if (d.nativeTrunc && (d.chatLen || 0) > 300) tips.push('想让长聊天彻底顺滑：可在 ST「用户设置→聊天截断」设为 0 后交给虚拟化，或反向保持在 100 条更省');
-    if (!d.nativeTrunc && (d.chatLen || 0) > 300 && !s.virtualize) tips.push('聊天截断为「不限」且消息很多，建议开启虚拟化或把 ST 聊天截断设成 100–200');
+    if (d.nativeTrunc) {
+        tips.push(`ST 原生「聊天截断」为 ${d.nativeTrunc} 条：更早消息本来就不渲染，无需再开「折叠较早消息」`);
+        if (d.nativeTrunc > 200 && (d.chatLen || 0) > 300) tips.push('若仍卡，可把原生截断降到 100–150 更省，只影响显示、不改变上下文');
+    } else if ((d.chatLen || 0) > 300) {
+        tips.push('ST 聊天截断为「不限」且消息很多：优先用「借用 ST 原生分页」设 100–200，比折叠更稳；或开启虚拟化');
+    }
     if (d.input.max > 100) tips.push(`输入延迟最大 ${Math.round(d.input.max)}ms：按键被主线程计算挡住（世界书扫描/正则/向量检索/tokenizer），不是输入框本身问题`);
     if (d.fadeIn && !s.streamFadeSkip) tips.push('「流式淡入」每个 tick 都要把整条消息按词重切 span 再 morphdom，长消息会明显卡；可开「生成时临时关闭流式淡入」或在 ST 里关掉');
     if (!d.fastUi && d.blurCount > 0) tips.push('ST 自带「快速 UI 模式」能一键去掉全界面毛玻璃（比逐项关更彻底），在 ST 用户设置里开启即可');
     if (d.regexCount > 5) tips.push(`已启用 ${d.regexCount} 条正则脚本，每条消息渲染都要全跑一遍；不常用的先在「正则」扩展里停用`);
     if (d.tokenCounter) tips.push('ST「显示每条消息 token」：消息落地和滑动时会分词一次，长聊天批量生成/大量滑动会加慢；不需要可在 ST 用户设置里关掉');
     if (d.renderMs > 120) tips.push(`消息落地约 ${Math.round(d.renderMs)}ms（事件到稳定一帧，含其它扩展的收尾处理），先查是否开了逐条 token 计数/TTS/总结类扩展`);
-    if (!d.nativeTrunc && (d.chatLen || 0) > 500) tips.push('消息超过 500 条且聊天截断为「不限」：最有效的是「借用 ST 原生分页」设成 150–300，比折叠更原生');
     if (d.loadMs > 800) tips.push(`上次打开聊天耗时 ${Math.round(d.loadMs)}ms（${d.loadCount} 条），可调低聊天截断或开虚拟化改善后续滚动`);
     if (d.extCount > 10) tips.push(`已启用 ${d.extCount} 个扩展，建议逐个停用排查（尤其自带定时器的）`);
     if (d.heavy.length >= 2) tips.push(`已启用 ${d.heavy.join('、')}：它们会随每条消息或每次生成额外触发工作（表情分类/TTS/翻译/记忆摘要/向量检索/正则）；卡顿时先停用不用的`);
@@ -1528,6 +1632,7 @@ function startFpsLoop() {
     state.lastSec = state.startedAt;
     state.frames = 0;
     const loop = (t) => {
+        if (state.disposed) { state.raf = 0; return; }
         state.raf = requestAnimationFrame(loop);
         if (document.hidden) {
             state.frames = 0;
@@ -1577,6 +1682,12 @@ function startMonitor() {
     if (state.tickTimer) clearInterval(state.tickTimer);
     state.tickTimer = setInterval(() => {
         if (document.hidden || !state.s || !state.s.enabled) return;
+        // 暂停 10 分钟到点自动恢复，避免用户一直停在「已暂停」却不知道
+        if (state.s.pausedUntil && Date.now() >= state.s.pausedUntil) {
+            state.s.pausedUntil = 0;
+            save();
+            applyAll();
+        }
         if (needsFps()) {
             if (!state.raf) startFpsLoop();
         } else if (state.raf) {
@@ -1598,7 +1709,7 @@ function startMonitor() {
 
 function onFps(fps) {
     state.fps = fps;
-    if (!state.s || !state.s.enabled) return;
+    if (state.disposed || !state.s || !state.s.enabled) return;
     if (performance.now() - state.startedAt < 4000) return;
 
     if (!state.s.autoDetect || isPaused()) {
@@ -1639,6 +1750,7 @@ function disableBoost() {
 /* ------------------------------------------------------------------ */
 
 function observeChat() {
+    if (state.disposed) return;
     const chat = chatEl();
     if (!chat) {
         setTimeout(observeChat, 800);
@@ -1653,7 +1765,17 @@ function observeChat() {
     }
     if (state.observer) state.observer.disconnect();
     state.observerTarget = chat;
-    state.observer = new MutationObserver(() => {
+    state.observer = new MutationObserver((records) => {
+        // 只有「消息节点本身」增删才让签名失效；折叠提示条/按钮也是 #chat 子节点，
+        // 如果一概重置会造成 applyTrim 反复插拔提示条的死循环
+        const messageChanged = records.some((r) => {
+            const nodes = [...r.addedNodes, ...r.removedNodes];
+            return nodes.some((n) => n.nodeType === 1 && n.classList && n.classList.contains('mes'));
+        });
+        if (messageChanged) {
+            state.trimSig = '';
+            state.clipDirty = true;
+        }
         scheduleSweep();
     });
     // 消息节点都是 #chat 的直接子节点，只观察 childList 即可；
@@ -1679,8 +1801,9 @@ function pauseObserver() {
 }
 
 function mountUi() {
-    if (!document.body || !state.s) return;
+    if (state.disposed || !document.body || !state.s) return;
     try {
+        if (state.panelEl && !state.panelEl.isConnected) state.panelEl = null;
         if (!state.panelEl && buildPanel()) {
             renderDiagnostics();
             syncPanel();
@@ -1701,28 +1824,59 @@ function registerEvents() {
     state.eventsBound = true;
     const et = c.eventTypes || {};
     const es = c.eventSource;
+    state.eventSource = es;
     const on = (name, fn) => {
         const type = et[name];
         if (!type) return;
         // 总开关关闭后事件仍会来，这里统一拦掉，避免禁用状态还在排队扫描
         const guarded = (...args) => {
-            if (!state.s || !state.s.enabled) return;
+            if (state.disposed || !state.s || !state.s.enabled) return;
             try { fn(...args); } catch (err) { console.warn('[AntiLag] 事件处理失败', name, err); }
         };
-        try { es.on(type, guarded); } catch (err) { /* 忽略 */ }
+        try {
+            es.on(type, guarded);
+            state.eventBindings.push([type, guarded]);
+        } catch (err) { /* 忽略 */ }
     };
 
-    on('APP_READY', () => { state.mountTries = 0; mountUi(); observeChat(); hookScrollIdle(); startInputTiming(); });
-    on('APP_INITIALIZED', () => { mountUi(); });
+    on('APP_READY', () => {
+        state.mountTries = 0;
+        // 初始化早期 getContext/powerUser 可能还没就绪，这里补一次应用
+        applyAll();
+        mountUi();
+        observeChat();
+        hookScrollIdle();
+        registerEvents();
+        startInputTiming();
+    });
+    on('APP_INITIALIZED', () => { applyAll(); mountUi(); registerEvents(); });
     on('CHAT_LOADED', () => {
         // 这个事件在 printMessages 之前触发：从这里开始计时，才能覆盖真正的解析+渲染
         state.chatLoading = true;
         state.chatLoadT0 = performance.now();
+        state.chatLoadMs = 0;
+        state.chatLoadCount = 0;
+        // 兜底：若某次加载没有等到 CHAT_CHANGED，别让虚拟化永久停在关闭状态
+        clearTimeout(state.chatLoadTimer);
+        state.chatLoadTimer = setTimeout(() => {
+            state.chatLoadTimer = 0;
+            if (state.disposed || !state.chatLoading) return;
+            state.chatLoading = false;
+            state.chatLoadT0 = 0;
+            applyAll();
+        }, 8000);
     });
     on('CHAT_CHANGED', () => {
         state.trimExpanded = false;
         state.trimSig = '';
+        state.clipSig = '';
+        state.clipDirty = true;
+        state.lastGenLt = 0;
+        state.tps = 0;
+        state.lastRenderMs = 0;
         state.chatLoading = false;
+        clearTimeout(state.chatLoadTimer);
+        state.chatLoadTimer = 0;
         applyAll();
         hookScrollIdle();
         scheduleSweep();
@@ -1770,6 +1924,10 @@ function registerEvents() {
         state.genT0 = 0;
         document.body.classList.remove('antilag-gen');
         restoreStreamFadeSkip();
+        if (state.nativeChanged && !state.chatLoading) {
+            state.nativeChanged = false;
+            rerenderChatSoon();
+        }
         observeChat();
         scheduleSweep();
         if (panelVisible()) renderDiagnostics();
@@ -1780,12 +1938,15 @@ function registerEvents() {
 
 function init() {
     try {
+        state.disposed = false;
         loadSettings();
         // 上次会话留下过流式降频 / 原生分页记录：先还原 ST 原值，再按当前开关决定是否重新套用
         if (state.s.streamFpsOrig) restoreStreamFps();
         if (state.s.truncApplied) restoreNativeLimit();
         if (state.s.fadeApplied) restoreStreamFadeSkip();
         applyAll();
+        // 保存过「借用 ST 原生分页」时，ST 首屏可能还按旧值渲染，补一次重渲染
+        if (state.s.nativeLimit) rerenderChatSoon();
         mountUi();
         observeChat();
         hookScrollIdle();
@@ -1813,6 +1974,9 @@ export function onDisable() {
     restoreNativeLimit();
     restoreStreamFadeSkip();
     state.s.enabled = false;
+    state.boost = false;
+    state.generating = false;
+    state.genT0 = 0;
     applyAll();
     pauseObserver();
     stopFpsLoop();
@@ -1836,6 +2000,7 @@ export function onEnable() {
     registerEvents();
     startMonitor();
     startInputTiming();
+    if (state.s.nativeLimit) rerenderChatSoon();
     // 禁用时停掉了 rAF，重新启用必须拉回来，否则自动降级不会工作
     if (needsFps()) startFpsLoop();
     return Promise.resolve();
@@ -1843,24 +2008,43 @@ export function onEnable() {
 
 /** 生命周期钩子：更新/删除前清理残留（manifest.hooks.clean） */
 export function onCleanUp() {
+    state.disposed = true;
     try { restoreStreamFps(); } catch (err) { /* 忽略 */ }
     try { restoreNativeLimit(); } catch (err) { /* 忽略 */ }
     try { restoreStreamFadeSkip(); } catch (err) { /* 忽略 */ }
     if (state.tickTimer) { clearInterval(state.tickTimer); state.tickTimer = 0; }
+    if (state.chatLoadTimer) { clearTimeout(state.chatLoadTimer); state.chatLoadTimer = 0; }
     stopFpsLoop();
     pauseObserver();
     try { state.po?.disconnect(); } catch (err) { /* 忽略 */ }
     try { state.eventPo?.disconnect(); } catch (err) { /* 忽略 */ }
     state.po = null;
     state.eventPo = null;
+    // 卸载时必须摘掉事件与滚动监听，否则同页重装会重复绑定、旧闭包继续跑
+    const es = state.eventSource;
+    const remove = es && (typeof es.removeListener === 'function' ? es.removeListener.bind(es) : (typeof es.off === 'function' ? es.off.bind(es) : null));
+    if (remove) {
+        state.eventBindings.forEach(([type, fn]) => { try { remove(type, fn); } catch (err) { /* 忽略 */ } });
+    }
+    state.eventBindings = [];
+    state.eventSource = null;
+    if (state.scrollTarget && state.scrollHandler) {
+        try { state.scrollTarget.removeEventListener('scroll', state.scrollHandler); } catch (err) { /* 忽略 */ }
+    }
+    state.scrollTarget = null;
+    state.scrollHandler = null;
+    if (state.scrollTimer) { clearTimeout(state.scrollTimer); state.scrollTimer = 0; }
+    if (rerenderTimer) { clearTimeout(rerenderTimer); rerenderTimer = 0; }
     state.eventsBound = false;
     try { clearStructural(); } catch (err) { /* 忽略 */ }
     ['antilag', 'antilag-virt', 'antilag-contain', 'antilag-gen', 'antilag-scrolling']
         .forEach((cls) => document.body && document.body.classList.remove(cls));
     if (document.documentElement) document.documentElement.classList.remove('antilag');
     if (state.styleEl) state.styleEl.remove();
+    document.getElementById('al-lite-style')?.remove();
     state.styleEl = null;
     document.getElementById('al-cv-style')?.remove();
+    try { document.documentElement.style.removeProperty('--al-cv-size'); } catch (err) { /* 忽略 */ }
     if (state.panelEl) state.panelEl.remove();
     state.panelEl = null;
     return Promise.resolve();
