@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -62,6 +62,9 @@ const DEFAULTS = {
 
     pauseOnEdit: true,
     preserveScroll: true,
+    scrollIdle: true,
+    streamFps: 0,
+    streamFpsOrig: 0,
 
     autoDetect: true,
     fpsThreshold: 28,
@@ -93,6 +96,10 @@ const TOGGLES = [
     ['al-clip', 'clipLong'],
     ['al-hud-on', 'hud'],
     ['al-notify', 'notify'],
+];
+
+const SELECTS = [
+    ['al-streamfps', 'streamFps'],
 ];
 
 const NUMBERS = [
@@ -133,6 +140,19 @@ const state = {
     lastGenLt: 0,
     mesCount: 0,
     applyQueued: false,
+    nativeTrunc: 0,
+    cvSize: 0,
+    chatLoadT0: 0,
+    chatLoadMs: 0,
+    chatLoadCount: 0,
+    inputEvents: [],
+    eventPo: null,
+    scrollTimer: 0,
+    tokens: 0,
+    genT0: 0,
+    tps: 0,
+    lastTps: 0,
+    eventsBound: false,
 };
 
 /* ------------------------------------------------------------------ */
@@ -202,6 +222,9 @@ function isOn() {
 function isEditing() {
     const ta = document.getElementById('curEditTextarea');
     if (ta && ta.getClientRects().length > 0) return true;
+    // 推理块编辑（ST 用 .reasoning_edit_textarea）
+    const rta = document.querySelector('.reasoning_edit_textarea');
+    if (rta && rta.getClientRects().length > 0) return true;
     if (document.querySelector('.mes_text[contenteditable="true"]')) return true;
     return false;
 }
@@ -235,6 +258,19 @@ function countMessages() {
 
 const eff = (key) => Boolean(state.s && (state.s[key] || (state.boost && BOOST_KEYS.includes(key))));
 
+/** SillyTavern 的 power_user 设置对象（getContext().powerUserSettings 即 power_user） */
+function powerUser() {
+    const c = ctx();
+    return c && c.powerUserSettings ? c.powerUserSettings : null;
+}
+
+/** ST 原生「聊天截断」：>0 时只渲染最近 N 条 + Show more messages，0/undefined 为不限 */
+function nativeTruncation() {
+    const pu = powerUser();
+    const v = Number(pu && pu.chat_truncation);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* 设置                                                                */
 /* ------------------------------------------------------------------ */
@@ -250,6 +286,8 @@ function loadSettings() {
     s.clipChars = clamp(parseInt(s.clipChars, 10) || DEFAULTS.clipChars, 500, 20000);
     s.fpsThreshold = clamp(parseInt(s.fpsThreshold, 10) || DEFAULTS.fpsThreshold, 10, 60);
     s.longTaskMs = clamp(parseInt(s.longTaskMs, 10) || DEFAULTS.longTaskMs, 50, 3000);
+    s.streamFps = [0, 10, 15, 20].includes(Number(s.streamFps)) ? Number(s.streamFps) : 0;
+    s.streamFpsOrig = clamp(parseInt(s.streamFpsOrig, 10) || 0, 0, 240);
     if (!PRESETS[s.mode] && s.mode !== 'custom') s.mode = DEFAULTS.mode;
 
     // 过期暂停自动清除
@@ -270,8 +308,18 @@ function buildCss() {
 
     if (document.body.classList.contains('antilag-virt')) {
         css += [
-            '/* 消息虚拟化：视口外消息跳过布局与绘制（仅在超过阈值时生效） */',
-            'body.antilag-virt #chat .mes{content-visibility:auto;contain-intrinsic-size:auto 240px;will-change:auto;}',
+            '/* 消息虚拟化：只对「热区之外」的消息跳过布局与绘制，热区（最近 30 条）永不跳过 */',
+            'body.antilag-virt #chat .mes:not(.al-hot){content-visibility:auto;contain-intrinsic-size:auto var(--al-cv-size, 240px);will-change:auto;}',
+            '/* contain-intrinsic-size 的 auto 会记住上次真实高度，未渲染过的用实测中位数兜底，避免滚动条抖动 */',
+            '',
+        ].join('\n');
+    }
+
+    if (state.s && state.s.scrollIdle) {
+        css += [
+            '/* 滚动中：暂时屏蔽消息按钮的命中测试与过渡，减少 hover/transition 触发的重复绘制（停止滚动即恢复） */',
+            'body.antilag-scrolling #chat .mes .mes_buttons,body.antilag-scrolling #chat .mes .mes_edit_buttons,body.antilag-scrolling #chat .mes .swipe_left,body.antilag-scrolling #chat .mes .swipe_right{pointer-events:none !important;}',
+            'body.antilag-scrolling #chat .mes,body.antilag-scrolling #chat .mes *{transition:none !important;}',
             '',
         ].join('\n');
     }
@@ -287,7 +335,7 @@ function buildCss() {
         } else {
             css += [
                 '/* 关闭聊天区毛玻璃与滤镜（不动其它界面） */',
-                'body.antilag #chat,body.antilag #chat *,body.antilag #chat *::before,body.antilag #chat *::after,body.antilag #form_sheld{backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
+                'body.antilag #chat,body.antilag #chat *,body.antilag #chat *::before,body.antilag #chat *::after,body.antilag #form_sheld,body.antilag #form_sheld *,body.antilag #send_form{backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
                 'body.antilag #chat .mes,body.antilag #chat .mes *{filter:none !important;}',
                 '',
             ].join('\n');
@@ -304,8 +352,8 @@ function buildCss() {
 
     if (eff('killShadow')) {
         css += [
-            '/* 关闭消息阴影与发光 */',
-            'body.antilag #chat .mes,body.antilag #chat .mes *{box-shadow:none !important;text-shadow:none !important;}',
+            '/* 关闭消息阴影与发光（#chat 自身在核心 CSS 里也带 text-shadow） */',
+            'body.antilag #chat,body.antilag #chat .mes,body.antilag #chat .mes *{box-shadow:none !important;text-shadow:none !important;}',
             '',
         ].join('\n');
     }
@@ -388,10 +436,158 @@ function refreshVirtGate() {
     const on = isOn();
     const mes = countMessages();
     state.mesCount = mes;
+    state.nativeTrunc = nativeTruncation();
     const virt = on && eff('virtualize') && mes >= state.s.virtualizeMin;
-    if (document.body.classList.contains('antilag-virt') === virt) return;
+    if (document.body.classList.contains('antilag-virt') === virt) {
+        applyHotZone();
+        return;
+    }
     document.body.classList.toggle('antilag-virt', virt);
     swapStyle(on ? buildCss() : '');
+    applyHotZone();
+    if (virt) scheduleMeasureCvSize();
+}
+
+/**
+ * 划定「热区」：最近 30 条消息永远不虚拟化。
+ * 流式输出、贴底滚动、编辑最后一条都发生在热区，避免 content-visibility 干扰这些路径。
+ */
+function applyHotZone() {
+    const chat = chatEl();
+    if (!chat) return;
+    const on = document.body.classList.contains('antilag-virt');
+    const mes = chat.querySelectorAll('.mes');
+    if (!on) {
+        if (chat.querySelector('.mes.al-hot')) {
+            chat.querySelectorAll('.mes.al-hot').forEach((el) => el.classList.remove('al-hot'));
+        }
+        return;
+    }
+    const hot = Math.min(30, mes.length);
+    for (let i = 0; i < mes.length; i++) {
+        const want = i >= mes.length - hot;
+        if (mes[i].classList.contains('al-hot') !== want) mes[i].classList.toggle('al-hot', want);
+    }
+}
+
+/**
+ * 用实测中位高度作为 contain-intrinsic-size 的兜底值。
+ * content-visibility 的元素未渲染时用估高，估高偏差会表现为滚动条跳动，所以取真实样本。
+ */
+function measureCvSize() {
+    const chat = chatEl();
+    if (!chat) return;
+    const sample = Array.from(chat.querySelectorAll('.mes:not(.al-hot)')).slice(-40);
+    if (!sample.length) return;
+    const heights = sample
+        .map((el) => el.getBoundingClientRect().height)
+        .filter((h) => h > 24)
+        .sort((a, b) => a - b);
+    if (!heights.length) return;
+    const median = heights[Math.floor(heights.length / 2)];
+    state.cvSize = Math.round(median);
+    setCvSize(`${state.cvSize}px`);
+}
+
+/** 写入 contain-intrinsic-size 的实测兜底值；样式表写入失败时退回独立 style 标签 */
+function setCvSize(value) {
+    const root = document.documentElement;
+    try {
+        if (root && root.style && typeof root.style.setProperty === 'function') {
+            root.style.setProperty('--al-cv-size', value);
+            return;
+        }
+    } catch (err) { /* 落到下面的兜底 */ }
+    let el = document.getElementById('al-cv-style');
+    if (!el) {
+        el = document.createElement('style');
+        el.id = 'al-cv-style';
+        document.head.appendChild(el);
+    }
+    el.textContent = `:root{--al-cv-size:${value}}`;
+}
+
+function scheduleMeasureCvSize() {
+    if (!state.s || !isOn()) return;
+    requestAnimationFrame(() => {
+        measureCvSize();
+        if (!state.cvSize) setTimeout(measureCvSize, 300);
+    });
+}
+
+/** 滚动期降载：滚动中屏蔽按钮命中测试与过渡，停止 160ms 后自动恢复 */
+function hookScrollIdle() {
+    const chat = chatEl();
+    if (!chat || chat.dataset.alScrolled === '1') return;
+    chat.dataset.alScrolled = '1';
+    chat.addEventListener('scroll', () => {
+        if (!state.s || !isOn() || !state.s.scrollIdle) return;
+        if (!document.body.classList.contains('antilag-scrolling')) {
+            document.body.classList.add('antilag-scrolling');
+        }
+        clearTimeout(state.scrollTimer);
+        state.scrollTimer = setTimeout(() => {
+            document.body.classList.remove('antilag-scrolling');
+        }, 160);
+    }, { passive: true });
+}
+
+/**
+ * 流式降频：ST 每个 tick 都会对整条消息重跑 正则 + DOMPurify + Markdown，
+ * 帧率由 power_user.streaming_fps 决定（默认 30）。这里提供一个「上限」开关。
+ * 只在下限生效时改 ST 设置，并记录原值；停用扩展/恢复默认/下次启动都会还原。
+ */
+function targetStreamFps() {
+    const pu = powerUser();
+    if (!pu || typeof pu.streaming_fps !== 'number') return 0;
+    const cap = Number(state.s && state.s.streamFps) || 0;
+    if (!isOn() || !cap) {
+        // 选回「不改」时也要立刻还原，不能把 ST 的流式 FPS 留在被限流的数值上
+        restoreStreamFps();
+        return 0;
+    }
+    if (!state.s.streamFpsOrig) {
+        state.s.streamFpsOrig = pu.streaming_fps;
+        save();
+    }
+    const target = Math.min(state.s.streamFpsOrig, cap);
+    if (pu.streaming_fps !== target) pu.streaming_fps = target;
+    return target;
+}
+
+function restoreStreamFps() {
+    const pu = powerUser();
+    const orig = Number(state.s && state.s.streamFpsOrig) || 0;
+    if (!pu || !orig) return;
+    if (Number(pu.streaming_fps) !== orig) pu.streaming_fps = orig;
+    state.s.streamFpsOrig = 0;
+    save();
+}
+
+/** 输入延迟（Chrome 的 event timing）：>100ms 说明按键被主线程计算挡住，而不是输入框本身的问题 */
+function startInputTiming() {
+    if (state.eventPo) return;
+    try {
+        const po = new PerformanceObserver((list) => {
+            const now = performance.now();
+            for (const entry of list.getEntries()) {
+                if (!['keydown', 'keypress', 'input', 'pointerdown'].includes(entry.name)) continue;
+                state.inputEvents.push({ t: now, d: entry.duration });
+            }
+            if (state.inputEvents.length > 40) state.inputEvents.splice(0, state.inputEvents.length - 40);
+        });
+        po.observe({ type: 'event', durationThreshold: 104, buffered: true });
+        state.eventPo = po;
+    } catch (err) {
+        // 浏览器不支持 event timing，静默降级
+    }
+}
+
+function recentInput() {
+    const now = performance.now();
+    state.inputEvents = state.inputEvents.filter((e) => now - e.t < 10000);
+    const max = state.inputEvents.reduce((acc, e) => Math.max(acc, e.d), 0);
+    return { count: state.inputEvents.length, max };
 }
 
 /* ------------------------------------------------------------------ */
@@ -405,15 +601,24 @@ function applyAll() {
     const on = isOn();
     const mes = countMessages();
     state.mesCount = mes;
+    state.nativeTrunc = nativeTruncation();
     const virt = on && eff('virtualize') && mes >= state.s.virtualizeMin;
+    const wasVirt = document.body.classList.contains('antilag-virt');
 
     document.documentElement.classList.toggle('antilag', on);
     document.body.classList.toggle('antilag', on);
     document.body.classList.toggle('antilag-virt', virt);
     document.body.classList.toggle('antilag-contain', on && eff('containChat'));
-    if (!on) document.body.classList.remove('antilag-gen');
+    if (!on) {
+        document.body.classList.remove('antilag-gen');
+        document.body.classList.remove('antilag-scrolling');
+    }
 
     swapStyle(on ? buildCss() : '');
+    applyHotZone();
+    if (virt && (!wasVirt || !state.cvSize)) scheduleMeasureCvSize();
+    if (on) targetStreamFps();
+    else restoreStreamFps();
     if (!on) {
         clearStructural();
     } else {
@@ -482,10 +687,12 @@ function applyTrim() {
     if (!chat) return;
 
     const s = state.s;
-    const active = Boolean(isOn() && s.trimHistory && !state.trimExpanded);
+    // ST 原生已有分页（chat_truncation + Show more messages）时不再叠一层折叠，避免两套历史机制互相打架
+    const nativePaging = Boolean(document.getElementById('show_more_messages'));
+    const active = Boolean(isOn() && s.trimHistory && !state.trimExpanded && !nativePaging);
     const keep = s.trimKeep;
     const mes = Array.from(chat.querySelectorAll('.mes'));
-    const sig = [mes.length, keep, active, state.trimExpanded].join('|');
+    const sig = [mes.length, keep, active, state.trimExpanded, nativePaging].join('|');
 
     if (!active || mes.length <= keep) {
         if (state.trimSig === sig) return;
@@ -645,6 +852,23 @@ function rowNumber(id, label, hint, value, unit, min, max, step) {
         </div>`;
 }
 
+function rowSelect(id, label, hint, value, options) {
+    const opts = options.map(([v, text]) => {
+        const sel = Number(v) === Number(value) ? ' selected' : '';
+        return `<option value="${v}"${sel}>${text}</option>`;
+    }).join('');
+    return `
+        <div class="al-row">
+            <div class="al-row-text">
+                <label for="${id}">${label}</label>
+                <span>${hint}</span>
+            </div>
+            <div class="al-num">
+                <select id="${id}">${opts}</select>
+            </div>
+        </div>`;
+}
+
 function buildPanel() {
     const host = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
     if (!host) return false;
@@ -678,8 +902,9 @@ function buildPanel() {
             <details class="al-fold">
                 <summary>体验保护（建议全开）</summary>
                 ${rowToggle('al-enabled', '启用 AntiLag', '总开关，关闭后所有注入立即移除', 'enabled')}
-                ${rowToggle('al-pause-on-edit', '编辑消息时暂停', '正在编辑/选中文本时不做折叠与裁剪，避免打断操作', 'pauseOnEdit')}
                 ${rowToggle('al-preserve-scroll', '切换时保持滚动位置', '任何开关切换都先记 #chat 位置再恢复，避免跳位', 'preserveScroll')}
+                ${rowToggle('al-scrollidle', '滚动期降载', '滚动时暂时屏蔽消息按钮的 hover 与过渡，停止滚动立即恢复', 'scrollIdle')}
+                ${rowToggle('al-pause-on-edit', '编辑消息时暂停', '正在编辑/选中文本时不做折叠与裁剪，避免打断操作', 'pauseOnEdit')}
                 ${rowToggle('al-auto', '自动降级', '连续掉帧时临时升级到极速视觉，恢复后自动退出', 'autoDetect')}
                 ${rowToggle('al-notify', '状态提示', '临时升级、暂停等动作弹出轻提示', 'notify')}
                 ${rowToggle('al-hud-on', '显示悬浮仪表', '右下角可拖动小球，实时看帧率', 'hud')}
@@ -697,6 +922,12 @@ function buildPanel() {
                 ${rowToggle('al-virtualize', '消息虚拟化', '视口外的消息跳过布局与绘制，只在消息数超阈值后生效', 'virtualize')}
                 ${rowNumber('al-vmin', '虚拟化阈值', '消息数达到该值才启用，短聊天完全不介入', s.virtualizeMin, '条', 30, 500, 10)}
                 ${rowToggle('al-genlite', '生成时轻量渲染', '流式输出时隔离并简化最后一条消息的重绘', 'genLite')}
+                ${rowSelect('al-streamfps', '流式降频', 'ST 每个 tick 都重跑正则+净化+Markdown；设上限可明显减负（会临时改 ST 的流式 FPS，停用即还原）', s.streamFps, [
+                    [0, '不改（跟随 ST 设置）'],
+                    [20, '上限 20 FPS'],
+                    [15, '上限 15 FPS'],
+                    [10, '上限 10 FPS（更省，文本更跳）'],
+                ])}
                 ${rowToggle('al-lazy', '图片懒加载', '聊天内图片改为 lazy + async 解码', 'lazyImg')}
                 ${rowToggle('al-lazyframe', 'iframe 懒加载', '消息里的网页/视频卡片延迟加载', 'lazyFrame')}
                 ${rowToggle('al-willchange', '清理 will-change', '回收被主题滥用的 GPU 图层，降低移动端内存压力', 'willChange')}
@@ -768,6 +999,16 @@ function bindPanel() {
         input.addEventListener('blur', commit);
     });
 
+    SELECTS.forEach(([id, key]) => {
+        const input = el.querySelector('#' + id);
+        if (!input) return;
+        input.addEventListener('change', () => {
+            state.s[key] = Number(input.value) || 0;
+            save();
+            applyAll();
+        });
+    });
+
     el.querySelectorAll('[data-preset]').forEach((btn) => {
         btn.addEventListener('click', () => {
             applyPreset(btn.dataset.preset);
@@ -798,6 +1039,10 @@ function syncPanel() {
         const input = el.querySelector('#' + id);
         // 用户正在输入的数字框不覆盖，避免每 5 秒刷新时吃掉按键
         if (input && document.activeElement !== input) input.value = String(state.s[key]);
+    });
+    SELECTS.forEach(([id, key]) => {
+        const input = el.querySelector('#' + id);
+        if (input && document.activeElement !== input) input.value = String(state.s[key] || 0);
     });
     const mode = detectMode();
     el.querySelectorAll('[data-preset]').forEach((btn) => {
@@ -842,6 +1087,7 @@ function updateBadge() {
 }
 
 function resetSettings() {
+    restoreStreamFps();
     state.s = JSON.parse(JSON.stringify(DEFAULTS));
     settingsStore()[MODULE_NAME] = state.s;
     save();
@@ -899,7 +1145,18 @@ function collectDiagnostics() {
             || (cs.backgroundAttachment && cs.backgroundAttachment.includes('fixed'));
     } catch (err) { /* 忽略 */ }
 
-    return { chatLen, mesDom, nodes, extCount, imgCount, blurCount, wcCount, longest, bgAnim };
+    const pu = powerUser() || {};
+    const nativeTrunc = Number(pu.chat_truncation) || 0;
+    const stStreamFps = Number(pu.streaming_fps) || 0;
+    const input = recentInput();
+
+    return {
+        chatLen, mesDom, nodes, extCount, imgCount, blurCount, wcCount, longest, bgAnim,
+        nativeTrunc, stStreamFps, input,
+        loadMs: state.chatLoadMs, loadCount: state.chatLoadCount, tps: state.tps,
+        virtOn: document.body.classList.contains('antilag-virt'),
+        cvSize: state.cvSize,
+    };
 }
 
 function renderDiagnostics() {
@@ -917,9 +1174,14 @@ function renderDiagnostics() {
     const items = [
         ['帧率', fps ? `${fps} FPS` : '采样中', fps && fps < s.fpsThreshold ? 'bad' : (fps && fps < 48 ? 'warn' : 'ok')],
         ['消息条数', String(d.chatLen || d.mesDom), (d.chatLen || d.mesDom) > 300 ? 'warn' : 'ok'],
+        ['渲染条数', `${d.mesDom} / 虚拟化${d.virtOn ? '开' : '关'}`, (d.mesDom > 400 && !d.virtOn) ? 'warn' : 'ok'],
+        ['原生截断', d.nativeTrunc ? `最近 ${d.nativeTrunc} 条` : '不限（全量渲染）', d.nativeTrunc ? 'ok' : ((d.chatLen > 300) ? 'warn' : 'ok')],
+        ['上次加载', d.loadMs ? `${d.loadCount} 条 / ${Math.round(d.loadMs)}ms` : '—', d.loadMs > 1200 ? 'warn' : 'ok'],
+        ['输入延迟 10s', d.input.max ? `最大 ${Math.round(d.input.max)}ms` : '无慢事件', d.input.max > 200 ? 'bad' : (d.input.max > 100 ? 'warn' : 'ok')],
         ['DOM 节点', String(d.nodes), d.nodes > 4000 ? 'warn' : 'ok'],
         ['10s 长任务', `${lt.count} 次 / 最长 ${Math.round(lt.max)}ms`, lt.max > s.longTaskMs ? 'bad' : 'ok'],
-        ['生成期长任务', `${state.lastGenLt} 次`, state.lastGenLt > 3 ? 'warn' : 'ok'],
+        ['生成期长任务', `${state.lastGenLt} 次${d.tps ? ` / ${d.tps} TPS` : ''}`, state.lastGenLt > 3 ? 'warn' : 'ok'],
+        ['流式帧率', d.stStreamFps ? `${d.stStreamFps} FPS` : '未知', (d.stStreamFps >= 30 && state.lastGenLt > 3) ? 'warn' : 'ok'],
         ['毛玻璃元素', String(d.blurCount), d.blurCount > 0 ? 'warn' : 'ok'],
         ['will-change', String(d.wcCount), d.wcCount > 2 ? 'warn' : 'ok'],
         ['动画背景', d.bgAnim ? '存在' : '无', d.bgAnim ? 'warn' : 'ok'],
@@ -942,6 +1204,14 @@ function renderDiagnostics() {
     if (fps && fps < s.fpsThreshold) tips.push('当前帧率偏低，可先切「均衡」，仍卡再切「极速」');
     if (lt.max > s.longTaskMs) tips.push(`存在 ${Math.round(lt.max)}ms 主线程长任务，多为大聊天渲染或重扩展造成`);
     if (state.lastGenLt > 3) tips.push('生成期间长任务偏多：多为长消息流式重绘，可开「生成时轻量渲染」');
+    if (state.lastGenLt > 3 && d.stStreamFps >= 25 && !s.streamFps) {
+        tips.push(`ST 流式刷新是 ${d.stStreamFps} FPS，每个 tick 都要重跑正则+净化+Markdown；可把「流式降频」设到 15–20`);
+    }
+    if (d.nativeTrunc) tips.push(`ST 原生「聊天截断」为 ${d.nativeTrunc} 条，更早的消息本来就不渲染，无需再开「折叠较早消息」`);
+    if (d.nativeTrunc && (d.chatLen || 0) > 300) tips.push('想让长聊天彻底顺滑：可在 ST「用户设置→聊天截断」设为 0 后交给虚拟化，或反向保持在 100 条更省');
+    if (!d.nativeTrunc && (d.chatLen || 0) > 300 && !s.virtualize) tips.push('聊天截断为「不限」且消息很多，建议开启虚拟化或把 ST 聊天截断设成 100–200');
+    if (d.input.max > 100) tips.push(`输入延迟最大 ${Math.round(d.input.max)}ms：按键被主线程计算挡住（世界书扫描/正则/向量检索/tokenizer），不是输入框本身问题`);
+    if (d.loadMs > 800) tips.push(`上次打开聊天耗时 ${Math.round(d.loadMs)}ms（${d.loadCount} 条），可调低聊天截断或开虚拟化改善后续滚动`);
     if (d.extCount > 10) tips.push(`已启用 ${d.extCount} 个扩展，建议逐个停用排查（尤其自带定时器的）`);
     if (isEditing()) tips.push('正在编辑消息，结构性优化已自动暂缓');
     if (!tips.length) tips.push('当前状态良好，保持现有配置即可');
@@ -1178,6 +1448,7 @@ function startMonitor() {
 
     if (state.tickTimer) clearInterval(state.tickTimer);
     state.tickTimer = setInterval(() => {
+        if (document.hidden) return;
         updateHud();
         state.diagTick++;
         if (state.diagTick >= 10) {
@@ -1240,7 +1511,7 @@ function observeChat() {
     }
     if (state.observer && state.observerTarget === chat) {
         if (!state.observerOn) {
-            state.observer.observe(chat, { childList: true, subtree: true });
+            state.observer.observe(chat, { childList: true });
             state.observerOn = true;
         }
         return;
@@ -1250,7 +1521,9 @@ function observeChat() {
     state.observer = new MutationObserver(() => {
         scheduleSweep();
     });
-    state.observer.observe(chat, { childList: true, subtree: true });
+    // 消息节点都是 #chat 的直接子节点，只观察 childList 即可；
+    // 消息体内容变化走 MESSAGE_UPDATED / MESSAGE_SWIPED / MESSAGE_EDITED 事件，不做全子树观察。
+    state.observer.observe(chat, { childList: true });
     state.observerOn = true;
     scheduleSweep();
 }
@@ -1281,8 +1554,10 @@ function mountUi() {
 }
 
 function registerEvents() {
+    if (state.eventsBound) return;
     const c = ctx();
     if (!c || !c.eventSource || typeof c.eventSource.on !== 'function') return;
+    state.eventsBound = true;
     const et = c.eventTypes || {};
     const es = c.eventSource;
     const on = (name, fn) => {
@@ -1291,22 +1566,44 @@ function registerEvents() {
         try { es.on(type, fn); } catch (err) { /* 忽略 */ }
     };
 
-    on('APP_READY', () => { state.mountTries = 0; mountUi(); observeChat(); });
+    on('APP_READY', () => { state.mountTries = 0; mountUi(); observeChat(); hookScrollIdle(); startInputTiming(); });
     on('APP_INITIALIZED', () => { mountUi(); });
     on('CHAT_CHANGED', () => {
         state.trimExpanded = false;
         state.trimSig = '';
+        state.chatLoadT0 = performance.now();
+        state.chatLoadMs = 0;
         applyAll();
+        hookScrollIdle();
         scheduleSweep();
+    });
+    on('CHAT_LOADED', () => {
+        // 等到两帧之后计时，才包含真正的渲染与绘制，而不是只算消息解析
+        const t0 = state.chatLoadT0 || performance.now();
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            const c = ctx();
+            state.chatLoadMs = performance.now() - t0;
+            state.chatLoadCount = c && Array.isArray(c.chat) ? c.chat.length : countMessages();
+            state.chatLoadT0 = 0;
+            if (isOn()) scheduleMeasureCvSize();
+            scheduleSweep();
+        }));
     });
     on('MESSAGE_RECEIVED', scheduleSweep);
     on('MESSAGE_SENT', scheduleSweep);
+    on('MESSAGE_EDITED', scheduleSweep);
+    on('MESSAGE_UPDATED', scheduleSweep);
+    on('MESSAGE_SWIPED', scheduleSweep);
+    on('MESSAGE_DELETED', scheduleSweep);
     on('USER_MESSAGE_RENDERED', scheduleSweep);
     on('CHARACTER_MESSAGE_RENDERED', scheduleSweep);
-    on('MORE_MESSAGES_LOADED', scheduleSweep);
+    on('MORE_MESSAGES_LOADED', () => { scheduleSweep(); scheduleMeasureCvSize(); });
+    on('STREAM_TOKEN_RECEIVED', () => { state.tokens++; });
     on('GENERATION_STARTED', () => {
         state.generating = true;
         state.genLt = 0;
+        state.genT0 = performance.now();
+        state.tokens = 0;
         pauseObserver();
         if (state.s && isOn() && state.s.genLite) document.body.classList.add('antilag-gen');
         else document.body.classList.remove('antilag-gen');
@@ -1314,6 +1611,11 @@ function registerEvents() {
     const endGen = () => {
         state.generating = false;
         state.lastGenLt = state.genLt;
+        if (state.genT0 && state.tokens) {
+            const sec = (performance.now() - state.genT0) / 1000;
+            state.tps = sec > 0.2 ? Math.round((state.tokens / sec) * 10) / 10 : 0;
+        }
+        state.genT0 = 0;
         document.body.classList.remove('antilag-gen');
         observeChat();
         scheduleSweep();
@@ -1326,11 +1628,15 @@ function registerEvents() {
 function init() {
     try {
         loadSettings();
+        // 上次会话留下过流式降频记录：先在启动时还原 ST 的原值，再按当前开关决定是否重新限流
+        if (state.s.streamFpsOrig) restoreStreamFps();
         applyAll();
         mountUi();
         observeChat();
+        hookScrollIdle();
         registerEvents();
         startMonitor();
+        startInputTiming();
 
         window.addEventListener('resize', () => {
             if (!state.hudEl) return;
@@ -1353,9 +1659,45 @@ if (document.readyState === 'loading') {
     init();
 }
 
-/** 生命周期钩子：被禁用时立即撤销所有注入 */
+/** 生命周期钩子：被禁用时立即撤销所有注入（在 manifest.hooks.disable 里声明） */
 export function onDisable() {
-    if (!state.s) return;
+    if (!state.s) return Promise.resolve();
+    restoreStreamFps();
     state.s.enabled = false;
     applyAll();
+    return Promise.resolve();
+}
+
+/** 生命周期钩子：重新启用时恢复注入（manifest.hooks.enable） */
+export function onEnable() {
+    if (!state.s) {
+        init();
+        return Promise.resolve();
+    }
+    state.s.enabled = true;
+    save();
+    applyAll();
+    mountUi();
+    observeChat();
+    hookScrollIdle();
+    registerEvents();
+    startMonitor();
+    startInputTiming();
+    return Promise.resolve();
+}
+
+/** 生命周期钩子：更新/删除前清理残留（manifest.hooks.clean） */
+export function onCleanUp() {
+    try { restoreStreamFps(); } catch (err) { /* 忽略 */ }
+    ['antilag', 'antilag-virt', 'antilag-contain', 'antilag-gen', 'antilag-scrolling']
+        .forEach((cls) => document.body && document.body.classList.remove(cls));
+    if (document.documentElement) document.documentElement.classList.remove('antilag');
+    if (state.styleEl) state.styleEl.remove();
+    state.styleEl = null;
+    document.getElementById('al-cv-style')?.remove();
+    if (state.hudEl) state.hudEl.remove();
+    state.hudEl = null;
+    if (state.panelEl) state.panelEl.remove();
+    state.panelEl = null;
+    return Promise.resolve();
 }

@@ -240,6 +240,31 @@
     padding-right: 3px;
 }
 
+/* 下拉（流式降频等） */
+.al-num select {
+    max-width: 132px;
+    padding: 3px 4px;
+    border: none;
+    background: transparent;
+    color: #f2e8d2;
+    font: 600 12px/1.3 inherit;
+    text-align: right;
+    text-align-last: right;
+    outline: none;
+    cursor: pointer;
+}
+
+.al-num select option {
+    background: #1a1712;
+    color: #f2e8d2;
+    text-align: left;
+}
+
+.al-num select:focus-visible {
+    outline: 1px solid rgba(212, 175, 55, 0.45);
+    border-radius: 6px;
+}
+
 /* 体检 */
 .al-diag {
     margin-top: 14px;

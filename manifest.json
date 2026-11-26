@@ -7,7 +7,12 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Doubao",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "auto_update": false,
-  "homePage": "https://github.com/Neohero521/SillyTavern-AntiLag"
+  "homePage": "https://github.com/Neohero521/SillyTavern-AntiLag",
+  "hooks": {
+    "disable": "onDisable",
+    "enable": "onEnable",
+    "clean": "onCleanUp"
+  }
 }
