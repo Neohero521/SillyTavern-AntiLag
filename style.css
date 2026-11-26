@@ -1,10 +1,9 @@
 /* ============================================================
    AntiLag 流畅优化 · 界面样式
-   仅作用于扩展自己的面板 / 悬浮仪表 / 折叠提示，不污染主题
+   仅作用于扩展自己的面板 / 折叠提示，不污染主题
    ============================================================ */
 
-.al-panel,
-.al-hud {
+.al-panel {
     --al-gold: #d4af37;
     --al-gold-soft: #e8c98a;
     --al-gold-dim: rgba(212, 175, 55, 0.22);
@@ -389,127 +388,6 @@
     line-height: 1.5;
 }
 
-/* ------------------------ 悬浮仪表 ------------------------ */
-
-.al-hud {
-    position: fixed;
-    right: 12px;
-    bottom: calc(92px + env(safe-area-inset-bottom, 0px));
-    z-index: 4000;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 8px;
-    touch-action: none;
-    pointer-events: none;
-}
-
-.al-hud > * {
-    pointer-events: auto;
-}
-
-.al-hud-pill {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    height: 38px;
-    padding: 0 13px 0 11px;
-    border-radius: 19px;
-    border: 1px solid rgba(212, 175, 55, 0.32);
-    background: linear-gradient(160deg, rgba(32, 30, 26, 0.9), rgba(16, 16, 18, 0.9));
-    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-    color: #f0e6d2;
-    cursor: grab;
-    user-select: none;
-    -webkit-user-select: none;
-    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.2s ease;
-    -webkit-tap-highlight-color: transparent;
-}
-
-.al-hud-pill:active,
-.al-hud.is-dragging .al-hud-pill {
-    cursor: grabbing;
-    transform: scale(1.04);
-    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45), 0 0 0 2px rgba(212, 175, 55, 0.2);
-}
-
-.al-hud-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #57d68a;
-    box-shadow: 0 0 8px currentColor;
-    transition: background 0.3s ease;
-}
-
-.al-hud[data-state="warn"] .al-hud-dot { background: #f0b23a; }
-.al-hud[data-state="bad"] .al-hud-dot { background: #e2604f; animation: al-pulse 1.4s ease-in-out infinite; }
-.al-hud[data-state="off"] .al-hud-dot { background: #77726b; box-shadow: none; }
-
-.al-hud-fps {
-    font: 600 13px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    min-width: 22px;
-    text-align: right;
-    letter-spacing: 0.4px;
-}
-
-.al-hud-unit {
-    font: 500 9.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    letter-spacing: 1.2px;
-    color: #b3a68c;
-    margin-top: 1px;
-}
-
-.al-hud-card {
-    width: 202px;
-    padding: 11px 12px 12px;
-    border-radius: 13px;
-    border: 1px solid rgba(212, 175, 55, 0.3);
-    background:
-        radial-gradient(110% 80% at 100% 0%, rgba(212, 175, 55, 0.12), transparent 60%),
-        linear-gradient(165deg, rgba(30, 28, 25, 0.96), rgba(14, 14, 16, 0.96));
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
-    color: #ece7dd;
-    transform-origin: 100% 100%;
-    animation: al-pop 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-.al-hud[data-open="false"] .al-hud-card {
-    display: none;
-}
-
-.al-hud-row {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 4px 0;
-    font-size: 11.5px;
-}
-
-.al-hud-row span {
-    color: #a99f8e;
-}
-
-.al-hud-row b {
-    font: 600 13px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    color: #f2e8d2;
-}
-
-.al-hud-actions {
-    display: flex;
-    gap: 7px;
-    margin-top: 9px;
-}
-
-.al-hud-actions .al-btn {
-    flex: 1 1 0;
-    min-height: 34px;
-    padding: 7px 8px;
-    font-size: 11.5px;
-    border-radius: 8px;
-}
-
 /* ------------------------ 折叠提示 ------------------------ */
 
 #chat .mes.al-trim {
@@ -561,19 +439,12 @@
 
 /* ------------------------ 动画 ------------------------ */
 
-@keyframes al-pulse {
-    0%, 100% { opacity: 1; box-shadow: 0 0 8px currentColor; }
-    50% { opacity: 0.55; box-shadow: 0 0 2px currentColor; }
-}
-
 @keyframes al-pop {
     from { opacity: 0; transform: scale(0.92) translateY(6px); }
     to { opacity: 1; transform: scale(1) translateY(0); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .al-hud-card { animation: none; }
-    .al-hud[data-state="bad"] .al-hud-dot { animation: none; }
     .al-switch i, .al-btn { transition: none; }
 }
 
@@ -607,30 +478,6 @@
 
     .al-diag-grid {
         grid-template-columns: 1fr;
-    }
-
-    .al-hud {
-        right: 10px;
-        bottom: calc(104px + env(safe-area-inset-bottom, 0px));
-    }
-
-    .al-hud-pill {
-        height: 42px;
-        padding: 0 14px 0 12px;
-        border-radius: 21px;
-    }
-
-    .al-hud-fps {
-        font-size: 14px;
-    }
-
-    .al-hud-card {
-        width: min(230px, 72vw);
-    }
-
-    .al-hud-actions .al-btn {
-        min-height: 40px;
-        font-size: 12px;
     }
 
     .al-trim-note {
@@ -802,60 +649,6 @@
     background: rgba(212, 175, 55, 0.2);
 }
 
-/* 悬浮仪表：模式头与快捷档位 */
-.al-hud-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    margin-bottom: 6px;
-}
-
-.al-hud-mode {
-    padding: 2px 8px;
-    border-radius: 999px;
-    border: 1px solid rgba(212, 175, 55, 0.3);
-    background: rgba(212, 175, 55, 0.08);
-    color: #e8c98a;
-    font-size: 10.5px;
-    letter-spacing: 0.4px;
-    max-width: 96px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.al-hud-fpsbig {
-    font: 600 15px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    color: #f2e8d2;
-}
-
-.al-hud-modes {
-    display: flex;
-    gap: 5px;
-    margin-top: 9px;
-}
-
-.al-hud-modes button {
-    appearance: none;
-    flex: 1 1 0;
-    height: 28px;
-    border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.05);
-    color: #c9c0ae;
-    font-size: 11px;
-    cursor: pointer;
-    transition: background 0.16s ease, border-color 0.16s ease;
-    -webkit-tap-highlight-color: transparent;
-}
-
-.al-hud-modes button.is-active {
-    border-color: rgba(232, 201, 138, 0.55);
-    background: rgba(212, 175, 55, 0.2);
-    color: #ffe6b0;
-}
-
 @media (max-width: 640px) {
     .al-modes {
         gap: 6px;
@@ -874,8 +667,4 @@
         padding: 11px 12px;
     }
 
-    .al-hud-modes button {
-        height: 32px;
-        font-size: 12px;
-    }
 }

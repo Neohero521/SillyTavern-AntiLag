@@ -1,5 +1,5 @@
 /**
- * AntiLag 流畅优化 v1.5 —— SillyTavern 扩展
+ * AntiLag 流畅优化 v1.6 —— SillyTavern 扩展
  *
  * 设计原则：
  * 1) 默认「轻度」模式视觉零改动，只做不改变观感的减负；
@@ -10,7 +10,7 @@
  */
 
 const MODULE_NAME = 'antilag';
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 
 /** 三档预设（只描述开关，不包含阈值） */
 const PRESETS = {
@@ -69,8 +69,10 @@ const DEFAULTS = {
     pauseOnEdit: true,
     preserveScroll: true,
     scrollIdle: true,
+    scrollBlur: false,
     streamFps: 0,
     streamFpsOrig: 0,
+    streamFpsApplied: 0,
     streamFadeSkip: false,
     fadeApplied: false,
 
@@ -78,8 +80,6 @@ const DEFAULTS = {
     fpsThreshold: 28,
     longTaskMs: 150,
 
-    hud: true,
-    hudPos: { x: null, y: null },
     notify: true,
     pausedUntil: 0,
 };
@@ -103,7 +103,7 @@ const TOGGLES = [
     ['al-contain', 'containChat'],
     ['al-trim', 'trimHistory'],
     ['al-clip', 'clipLong'],
-    ['al-hud-on', 'hud'],
+    ['al-scrollblur', 'scrollBlur'],
     ['al-notify', 'notify'],
 ];
 
@@ -124,7 +124,6 @@ const state = {
     s: null,
     styleEl: null,
     panelEl: null,
-    hudEl: null,
     mountTries: 0,
     observer: null,
     observerTarget: null,
@@ -144,7 +143,8 @@ const state = {
     diagTick: 0,
     trimSig: '',
     trimExpanded: false,
-    hudOpen: false,
+    chatLoading: false,
+    hotTotal: 0,
     generating: false,
     genLt: 0,
     lastGenLt: 0,
@@ -267,7 +267,13 @@ function chatEl() {
 
 function countMessages() {
     const chat = chatEl();
-    return chat ? chat.querySelectorAll('.mes').length : 0;
+    if (!chat) return 0;
+    // 直接子节点就是消息；用 live collection，避免每次扫描都分配一份 NodeList 数组
+    try {
+        return chat.getElementsByClassName('mes').length;
+    } catch (err) {
+        return chat.querySelectorAll('.mes').length;
+    }
 }
 
 const eff = (key) => Boolean(state.s && (state.s[key] || (state.boost && BOOST_KEYS.includes(key))));
@@ -332,7 +338,8 @@ function applyStreamFadeSkip() {
 function restoreStreamFadeSkip() {
     const pu = powerUser();
     if (!pu || !state.s || !state.s.fadeApplied) return;
-    if (pu.stream_fade_in !== true) pu.stream_fade_in = true;
+    // 只有仍是我们关掉的状态才还原；用户在手期间自己重新打开/关闭都尊重用户
+    if (pu.stream_fade_in === false) pu.stream_fade_in = true;
     state.s.fadeApplied = false;
     save();
 }
@@ -341,6 +348,20 @@ function restoreStreamFadeSkip() {
 function hotZoneTick() {
     if (!isOn() || !document.body.classList.contains('antilag-virt')) return;
     applyHotZone();
+}
+
+let rerenderTimer = 0;
+/** 原生分页改动后重新渲染当前聊天（ST 的 printMessages 是公开 API） */
+function rerenderChatSoon() {
+    if (rerenderTimer) return;
+    rerenderTimer = setTimeout(() => {
+        rerenderTimer = 0;
+        if (!isOn() || state.generating || state.chatLoading) return;
+        const c = ctx();
+        if (!c || typeof c.printMessages !== 'function') return;
+        if (!Array.isArray(c.chat) || !c.chat.length) return;
+        Promise.resolve(c.printMessages()).catch((err) => console.warn('[AntiLag] 重新渲染失败', err));
+    }, 400);
 }
 
 function restoreNativeLimit() {
@@ -364,7 +385,6 @@ function loadSettings() {
     const incoming = (store[MODULE_NAME] && typeof store[MODULE_NAME] === 'object') ? store[MODULE_NAME] : {};
     const s = Object.assign({}, DEFAULTS, incoming);
 
-    s.hudPos = Object.assign({ x: null, y: null }, incoming.hudPos || {});
     s.virtualizeMin = clamp(parseInt(s.virtualizeMin, 10) || DEFAULTS.virtualizeMin, 30, 500);
     s.trimKeep = clamp(parseInt(s.trimKeep, 10) || DEFAULTS.trimKeep, 10, 3000);
     s.clipChars = clamp(parseInt(s.clipChars, 10) || DEFAULTS.clipChars, 500, 20000);
@@ -372,6 +392,7 @@ function loadSettings() {
     s.longTaskMs = clamp(parseInt(s.longTaskMs, 10) || DEFAULTS.longTaskMs, 50, 3000);
     s.streamFps = [0, 10, 15, 20].includes(Number(s.streamFps)) ? Number(s.streamFps) : 0;
     s.streamFpsOrig = clamp(parseInt(s.streamFpsOrig, 10) || 0, 0, 240);
+    s.streamFpsApplied = clamp(parseInt(s.streamFpsApplied, 10) || 0, 0, 240);
     s.fadeApplied = Boolean(s.fadeApplied);
     s.nativeLimit = [0, 100, 150, 300].includes(Number(s.nativeLimit)) ? Number(s.nativeLimit) : 0;
     s.truncOrig = clamp(parseInt(s.truncOrig, 10) || 0, 0, 5000);
@@ -397,7 +418,7 @@ function buildCss() {
     if (document.body.classList.contains('antilag-virt')) {
         css += [
             '/* 消息虚拟化：只对「热区之外」的消息跳过布局与绘制，热区（最近 30 条）永不跳过 */',
-            'body.antilag-virt #chat .mes:not(.al-hot){content-visibility:auto;contain-intrinsic-size:auto var(--al-cv-size, 240px);will-change:auto;}',
+            'body.antilag-virt #chat .mes:not(.al-hot){content-visibility:auto;contain-intrinsic-size:var(--al-cv-size, 240px);contain-intrinsic-size:auto var(--al-cv-size, 240px);will-change:auto;}',
             '/* contain-intrinsic-size 的 auto 会记住上次真实高度，未渲染过的用实测中位数兜底，避免滚动条抖动 */',
             '',
         ].join('\n');
@@ -432,8 +453,9 @@ function buildCss() {
 
     if (eff('killBgAnim')) {
         css += [
-            '/* 停用动画背景与 fixed 背景 */',
-            'html.antilag body,body.antilag #chat,body.antilag #bg_custom,body.antilag .background{animation:none !important;background-attachment:scroll !important;}',
+            '/* 停用动画背景与 fixed 背景：ST 真正的 fixed 背景是 #bg1（backgrounds.css），不是 body/#chat */',
+            'html.antilag body,body.antilag #chat,body.antilag .background{animation:none !important;}',
+            'body.antilag #bg1,body.antilag #bg_custom,body.antilag #bg_custom_content{background-attachment:scroll !important;transition:none !important;}',
             '',
         ].join('\n');
     }
@@ -456,8 +478,8 @@ function buildCss() {
 
     if (eff('willChange')) {
         css += [
-            '/* 清理被滥用的 will-change，回收 GPU 图层（移动端收益明显） */',
-            'body.antilag #chat *{will-change:auto !important;}',
+            '/* 清理被滥用的 will-change，回收 GPU 图层；但保留 ST 滑动动画 .slide 自己的合成提示 */',
+            'body.antilag #chat *:not(.slide){will-change:auto !important;}',
             '',
         ].join('\n');
     }
@@ -465,7 +487,7 @@ function buildCss() {
     if (document.body.classList.contains('antilag-contain')) {
         css += [
             '/* 隔离聊天区的布局与绘制，避免抽屉/输入框重排牵连 */',
-            'body.antilag-contain #chat{contain:layout style;overscroll-behavior:contain;}',
+            'body.antilag-contain #chat{contain:layout;overscroll-behavior:contain;}',
             '',
         ].join('\n');
     }
@@ -473,10 +495,19 @@ function buildCss() {
     if (s.genLite) {
         css += [
             '/* 生成中：隔离最后一条消息的重绘，并去掉其重特效 */',
-            'body.antilag-gen #chat .last_mes{contain:layout paint style;}',
+            '/* 只隔离布局与样式：不加 paint，避免流式期间裁掉消息内的阴影/悬浮元素 */',
+            'body.antilag-gen #chat .last_mes{contain:layout;}',
             '/* 正在流式的最后一条绝不跳过布局，避免 content-visibility 与逐字重绘打架 */',
             'body.antilag-gen #chat .mes:last-child{content-visibility:visible !important;}',
             'body.antilag-gen #chat .last_mes,body.antilag-gen #chat .last_mes *{box-shadow:none !important;text-shadow:none !important;filter:none !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;transition:none !important;animation:none !important;}',
+            '',
+        ].join('\n');
+    }
+
+    if (s.scrollBlur) {
+        css += [
+            '/* 滚动期间临时关掉聊天区模糊：滚动时每帧都要重新采样背景，低配机收益最大；停手 160ms 自动恢复 */',
+            'body.antilag-scrolling #chat,body.antilag-scrolling #chat *,body.antilag-scrolling #send_form,body.antilag-scrolling #form_sheld{backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
             '',
         ].join('\n');
     }
@@ -528,7 +559,7 @@ function refreshVirtGate() {
     state.mesCount = mes;
     state.nativeTrunc = nativeTruncation();
     // 原生分页开着时不做虚拟化：ST 每次「Show more」都会前插并补偿滚动，content-visibility 会把高度估歪
-    const virt = on && eff('virtualize') && !nativePagingActive() && mes >= state.s.virtualizeMin;
+    const virt = on && eff('virtualize') && !nativePagingActive() && !state.chatLoading && mes >= state.s.virtualizeMin;
     if (document.body.classList.contains('antilag-virt') === virt) {
         applyHotZone();
         return;
@@ -547,17 +578,26 @@ function applyHotZone() {
     const chat = chatEl();
     if (!chat) return;
     const on = document.body.classList.contains('antilag-virt');
-    const mes = chat.querySelectorAll('.mes');
+    const mes = chat.getElementsByClassName('mes');
     if (!on) {
-        if (chat.querySelector('.mes.al-hot')) {
-            chat.querySelectorAll('.mes.al-hot').forEach((el) => el.classList.remove('al-hot'));
+        if (state.hotTotal) {
+            const hots = chat.getElementsByClassName('al-hot');
+            while (hots.length) hots[0].classList.remove('al-hot');
+            state.hotTotal = 0;
         }
         return;
     }
-    const hot = Math.min(30, mes.length);
-    for (let i = 0; i < mes.length; i++) {
-        const want = i >= mes.length - hot;
-        if (mes[i].classList.contains('al-hot') !== want) mes[i].classList.toggle('al-hot', want);
+    const total = mes.length;
+    const hot = Math.min(30, total);
+    // 只动尾部热区；消息总数变化（前插/删除）时才清理一次旧热区，避免每次扫描全部消息
+    for (let i = total - hot; i < total; i++) {
+        if (!mes[i].classList.contains('al-hot')) mes[i].classList.add('al-hot');
+    }
+    if (state.hotTotal !== total) {
+        for (let i = 0; i < total - hot; i++) {
+            if (mes[i].classList.contains('al-hot')) mes[i].classList.remove('al-hot');
+        }
+        state.hotTotal = total;
     }
 }
 
@@ -568,7 +608,8 @@ function applyHotZone() {
 function measureCvSize() {
     const chat = chatEl();
     if (!chat) return;
-    const sample = Array.from(chat.querySelectorAll('.mes:not(.al-hot)')).slice(-40);
+    // 只量热区（永不虚拟化）的真实高度：虚拟化元素返回的是估高，用它算中位数会自我循环
+    const sample = Array.from(chat.querySelectorAll('.mes.al-hot')).slice(-30);
     if (!sample.length) return;
     const heights = sample
         .map((el) => el.getBoundingClientRect().height)
@@ -612,7 +653,7 @@ function hookScrollIdle() {
     if (!chat || chat.dataset.alScrolled === '1') return;
     chat.dataset.alScrolled = '1';
     chat.addEventListener('scroll', () => {
-        if (!state.s || !isOn() || !state.s.scrollIdle) return;
+        if (!state.s || !isOn() || (!state.s.scrollIdle && !state.s.scrollBlur)) return;
         if (!document.body.classList.contains('antilag-scrolling')) {
             document.body.classList.add('antilag-scrolling');
         }
@@ -642,17 +683,23 @@ function targetStreamFps() {
         save();
     }
     const target = Math.min(state.s.streamFpsOrig, cap);
+    state.s.streamFpsApplied = target;
     if (pu.streaming_fps !== target) pu.streaming_fps = target;
     return target;
 }
 
 function restoreStreamFps() {
     const pu = powerUser();
-    const orig = Number(state.s && state.s.streamFpsOrig) || 0;
-    if (!pu || !orig) return;
-    if (Number(pu.streaming_fps) !== orig) pu.streaming_fps = orig;
-    state.s.streamFpsOrig = 0;
-    save();
+    if (!pu || !state.s) return;
+    const orig = Number(state.s.streamFpsOrig) || 0;
+    const applied = Number(state.s.streamFpsApplied) || 0;
+    // 只在当前值仍是我们写进去的那个时才还原，用户在 ST 设置里改过就尊重用户
+    if (orig && applied && Number(pu.streaming_fps) === applied) pu.streaming_fps = orig;
+    if (state.s.streamFpsOrig || state.s.streamFpsApplied) {
+        state.s.streamFpsOrig = 0;
+        state.s.streamFpsApplied = 0;
+        save();
+    }
 }
 
 /** 输入延迟（Chrome 的 event timing）：>100ms 说明按键被主线程计算挡住，而不是输入框本身的问题 */
@@ -705,7 +752,7 @@ function applyAll() {
     state.mesCount = mes;
     state.nativeTrunc = nativeTruncation();
     // 原生分页开着时不做虚拟化：ST 每次「Show more」都会前插并补偿滚动，content-visibility 会把高度估歪
-    const virt = on && eff('virtualize') && !nativePagingActive() && mes >= state.s.virtualizeMin;
+    const virt = on && eff('virtualize') && !nativePagingActive() && !state.chatLoading && mes >= state.s.virtualizeMin;
     const wasVirt = document.body.classList.contains('antilag-virt');
 
     document.documentElement.classList.toggle('antilag', on);
@@ -737,10 +784,8 @@ function applyAll() {
         applyClip();
     }
 
-    if (state.hudEl) state.hudEl.style.display = state.s.hud ? '' : 'none';
     syncPanel();
     updateBadge();
-    updateHud();
 }
 
 function queueApply() {
@@ -753,27 +798,51 @@ function queueApply() {
 }
 
 function clearStructural() {
+    clearImages();
     const chat = chatEl();
     if (!chat) return;
     chat.querySelectorAll('.al-trim-note').forEach((el) => el.remove());
     chat.querySelectorAll('.mes.al-trim').forEach((el) => el.classList.remove('al-trim'));
     chat.querySelectorAll('.mes.al-clip').forEach((el) => el.classList.remove('al-clip'));
     chat.querySelectorAll('.al-clip-btn').forEach((el) => el.remove());
+    chat.querySelectorAll('.mes.al-hot').forEach((el) => el.classList.remove('al-hot'));
+    state.hotTotal = 0;
+}
+
+/** 撤销我们自己加在媒体上的懒加载属性；原本就有 loading/decoding 的不动 */
+function clearImages() {
+    document.querySelectorAll('#chat [data-al-lazy]').forEach((el) => {
+        if (el.dataset.alLoading === '1') el.removeAttribute('loading');
+        if (el.dataset.alDecoding === '1') el.removeAttribute('decoding');
+        el.classList.remove('al-lazy');
+        delete el.dataset.alLazy;
+        delete el.dataset.alLoading;
+        delete el.dataset.alDecoding;
+    });
 }
 
 function applyImages() {
-    if (!eff('lazyImg')) return;
+    if (!eff('lazyImg')) { clearImages(); return; }
     // 只处理消息正文里的图（含媒体块）：头像同 URL 且尺寸小，懒加载反而会在滚动时闪加载
     document.querySelectorAll('#chat .mes_block img:not([data-al-lazy])').forEach((img) => {
         img.dataset.alLazy = '1';
-        if (!img.hasAttribute('loading')) img.setAttribute('loading', 'lazy');
-        if (!img.hasAttribute('decoding')) img.setAttribute('decoding', 'async');
         img.classList.add('al-lazy');
+        if (!img.hasAttribute('loading')) {
+            img.setAttribute('loading', 'lazy');
+            img.dataset.alLoading = '1';
+        }
+        if (!img.hasAttribute('decoding')) {
+            img.setAttribute('decoding', 'async');
+            img.dataset.alDecoding = '1';
+        }
     });
     if (eff('lazyFrame')) {
         document.querySelectorAll('#chat .mes_block iframe:not([data-al-lazy])').forEach((frame) => {
             frame.dataset.alLazy = '1';
-            frame.setAttribute('loading', 'lazy');
+            if (!frame.hasAttribute('loading')) {
+                frame.setAttribute('loading', 'lazy');
+                frame.dataset.alLoading = '1';
+            }
         });
     }
 }
@@ -802,12 +871,12 @@ function applyTrim() {
     const nativePaging = Boolean(document.getElementById('show_more_messages'));
     const active = Boolean(isOn() && s.trimHistory && !state.trimExpanded && !nativePaging);
     const keep = s.trimKeep;
-    const mes = Array.from(chat.querySelectorAll('.mes'));
-    const sig = [mes.length, keep, active, state.trimExpanded, nativePaging].join('|');
 
-    if (!active || mes.length <= keep) {
-        if (state.trimSig === sig) return;
-        state.trimSig = sig;
+    if (!active) {
+        // 未启用时不做全量扫描：只有真的存在折叠残留时才清理
+        const dirty = chat.querySelector('.mes.al-trim, .al-trim-note');
+        if (!dirty) { state.trimSig = 'off'; return; }
+        state.trimSig = 'off';
         withChatScroll(() => {
             chat.querySelectorAll('.al-trim-note').forEach((el) => el.remove());
             chat.querySelectorAll('.mes.al-trim').forEach((el) => el.classList.remove('al-trim'));
@@ -815,10 +884,22 @@ function applyTrim() {
         return;
     }
     if (s.pauseOnEdit && isBusy()) return;
+
+    const mes = chat.getElementsByClassName('mes');
+    const total = mes.length;
+    const sig = `${total}|${keep}|on`;
     if (state.trimSig === sig) return;
+    if (total <= keep) {
+        state.trimSig = sig;
+        withChatScroll(() => {
+            chat.querySelectorAll('.al-trim-note').forEach((el) => el.remove());
+            chat.querySelectorAll('.mes.al-trim').forEach((el) => el.classList.remove('al-trim'));
+        });
+        return;
+    }
     state.trimSig = sig;
 
-    const cut = mes.length - keep;
+    const cut = total - keep;
     withChatScroll(() => {
         chat.querySelectorAll('.al-trim-note').forEach((el) => el.remove());
         chat.querySelectorAll('.mes.al-trim').forEach((el) => el.classList.remove('al-trim'));
@@ -844,8 +925,11 @@ function applyClip() {
     const chat = chatEl();
     if (!chat) return;
     if (!isOn() || !state.s.clipLong) {
-        chat.querySelectorAll('.mes.al-clip').forEach((el) => el.classList.remove('al-clip'));
-        chat.querySelectorAll('.al-clip-btn').forEach((el) => el.remove());
+        // 关掉时只在确实有残留折叠时才清理，避免每次扫描都全量 query
+        if (chat.querySelector('.mes.al-clip, .al-clip-btn')) {
+            chat.querySelectorAll('.mes.al-clip').forEach((el) => el.classList.remove('al-clip'));
+            chat.querySelectorAll('.al-clip-btn').forEach((el) => el.remove());
+        }
         state.clipSig = '';
         state.clipDirty = true;
         return;
@@ -888,7 +972,8 @@ function applyClip() {
                 mes.classList.remove('al-clip');
                 btn.remove();
             });
-            mes.appendChild(btn);
+            // 放进 .mes_block（flex 列）而不是 .mes（flex 行），否则按钮会挤在消息右侧、压缩正文宽度
+            (mes.querySelector('.mes_block') || mes).appendChild(btn);
         });
     });
 
@@ -1047,7 +1132,6 @@ function buildPanel() {
                 ${rowToggle('al-pause-on-edit', '编辑消息时暂停', '正在编辑/选中文本时不做折叠与裁剪，避免打断操作', 'pauseOnEdit')}
                 ${rowToggle('al-auto', '自动降级', '连续掉帧时临时升级到极速视觉，恢复后自动退出', 'autoDetect')}
                 ${rowToggle('al-notify', '状态提示', '临时升级、暂停等动作弹出轻提示', 'notify')}
-                ${rowToggle('al-hud-on', '显示悬浮仪表', '右下角可拖动小球，实时看帧率', 'hud')}
                 <div class="al-row">
                     <div class="al-row-text">
                         <label>暂停优化</label>
@@ -1072,7 +1156,8 @@ function buildPanel() {
                 ${rowToggle('al-lazy', '图片懒加载', '聊天内图片改为 lazy + async 解码', 'lazyImg')}
                 ${rowToggle('al-lazyframe', 'iframe 懒加载', '消息里的网页/视频卡片延迟加载', 'lazyFrame')}
                 ${rowToggle('al-willchange', '清理 will-change', '回收被主题滥用的 GPU 图层，降低移动端内存压力', 'willChange')}
-                ${rowToggle('al-killblur', '关闭毛玻璃 / 滤镜', 'backdrop-filter 是掉帧第一大户，关闭后画面变朴素但明显更顺', 'killBlur')}
+                ${rowToggle('al-scrollblur', '滚动时临时关模糊', '滚动时每帧都要重新采样背景，低配机收益最大；停手 160ms 自动恢复（会有一瞬视觉跳变）', 'scrollBlur')}
+                ${rowToggle('al-killblur', '关闭毛玻璃 / 滤镜', 'backdrop-filter 是掉帧第一大户；ST「快速 UI」开着时本项看不到变化（已被 ST 全局去掉）', 'killBlur')}
                 ${rowToggle('al-killblur-all', '毛玻璃关闭范围：全界面', '默认只关聊天区，打开后连抽屉、顶栏、弹窗一起关', 'killBlurAll')}
                 ${rowToggle('al-killbg', '停用动画背景', '停掉背景动画与 fixed 背景，滚动更稳', 'killBgAnim')}
                 ${rowToggle('al-killshadow', '关闭阴影', '去掉消息的 box-shadow / text-shadow', 'killShadow')}
@@ -1084,7 +1169,7 @@ function buildPanel() {
                 <summary>历史与超长消息</summary>
                 ${rowToggle('al-trim', '折叠较早消息', '更早的消息移出渲染树，顶部可一键展开', 'trimHistory')}
                 ${rowNumber('al-keep', '折叠后保留', '保留最近多少条消息可见', s.trimKeep, '条', 10, 3000, 10)}
-                ${rowSelect('al-nativelimit', '借用 ST 原生分页', '把 ST 的「聊天截断」设为固定条数：只渲染最近 N 条，顶部「Show more」可翻回；只影响显示、不影响上下文', s.nativeLimit, [
+                ${rowSelect('al-nativelimit', '借用 ST 原生分页', '把 ST 的「聊天截断」设为固定条数，改完立即重渲染；只影响显示、不影响上下文', s.nativeLimit, [
                     [0, '不改（用 ST 当前设置）'],
                     [100, '最近 100 条'],
                     [150, '最近 150 条'],
@@ -1153,6 +1238,8 @@ function bindPanel() {
             state.s[key] = Number(input.value) || 0;
             save();
             applyAll();
+            // 原生分页是渲染期设置，改完必须重新渲染当前聊天才会生效
+            if (key === 'nativeLimit') rerenderChatSoon();
         });
     });
 
@@ -1240,12 +1327,6 @@ function resetSettings() {
     state.s = JSON.parse(JSON.stringify(DEFAULTS));
     settingsStore()[MODULE_NAME] = state.s;
     save();
-    if (state.hudEl) {
-        state.hudEl.style.left = '';
-        state.hudEl.style.top = '';
-        state.hudEl.style.right = '';
-        state.hudEl.style.bottom = '';
-    }
     applyAll();
     syncPanel();
     toast('info', '已恢复默认（轻度）设置');
@@ -1270,18 +1351,31 @@ function collectDiagnostics() {
         ? c.extensionSettings.disabledExtensions : [];
     const heavy = HEAVY_EXTS.filter((k) => c && c.extensionSettings
         && Boolean(c.extensionSettings[k]) && !disabledExts.includes(k));
+    // extension_settings 里混着 apiUrl/note 等非扩展键，直接数键名会虚高；排除元数据并跳过已禁用的
+    const META_KEYS = ['apiUrl', 'apiKey', 'autoConnect', 'notifyUpdates', 'disabledExtensions', 'expressionOverrides', MODULE_NAME];
     const extCount = c && c.extensionSettings
-        ? Object.keys(c.extensionSettings).filter((k) => k !== MODULE_NAME).length
+        ? Object.keys(c.extensionSettings)
+            .filter((k) => !META_KEYS.includes(k) && !disabledExts.includes(k)).length
         : 0;
     const imgCount = document.querySelectorAll('#chat img').length;
 
     let blurCount = 0;
     let wcCount = 0;
+    const hasBlur = (cs) => {
+        const bf = cs.backdropFilter || cs.webkitBackdropFilter;
+        if (bf && bf !== 'none') return true;
+        const f = cs.filter || '';
+        return f.includes('blur(') || f.includes('drop-shadow(');
+    };
+    // 真正的模糊在容器上：只扫消息会漏掉 #chat / #send_form 这两个大头
+    ['#chat', '#send_form', '#form_sheld', '#top-bar'].forEach((sel) => {
+        const el = document.querySelector(sel);
+        if (el && hasBlur(getComputedStyle(el))) blurCount++;
+    });
     const sample = Array.from(document.querySelectorAll('#chat .mes')).slice(-30);
     for (const mes of sample) {
         const cs = getComputedStyle(mes);
-        const bf = cs.backdropFilter || cs.webkitBackdropFilter;
-        if ((bf && bf !== 'none') || (cs.filter && cs.filter !== 'none')) blurCount++;
+        if (hasBlur(cs)) blurCount++;
         if (cs.willChange && cs.willChange !== 'auto') wcCount++;
         const child = mes.firstElementChild;
         if (child) {
@@ -1300,8 +1394,14 @@ function collectDiagnostics() {
     let bgAnim = false;
     try {
         const cs = getComputedStyle(document.body);
-        bgAnim = (cs.animationName && cs.animationName !== 'none')
-            || (cs.backgroundAttachment && cs.backgroundAttachment.includes('fixed'));
+        bgAnim = Boolean(cs.animationName && cs.animationName !== 'none');
+        // ST 真正的 fixed 背景在 #bg1（backgrounds.css），不是 body
+        const bg1 = document.getElementById('bg1');
+        if (bg1) {
+            const cs1 = getComputedStyle(bg1);
+            if (cs1.backgroundAttachment && cs1.backgroundAttachment.includes('fixed')) bgAnim = true;
+            if (cs1.animationName && cs1.animationName !== 'none') bgAnim = true;
+        }
     } catch (err) { /* 忽略 */ }
 
     const pu = powerUser() || {};
@@ -1319,7 +1419,7 @@ function collectDiagnostics() {
         tokenCounter: Boolean(pu.message_token_count_enabled),
         fadeIn: Boolean(pu.stream_fade_in),
         fastUi: Boolean(pu.fast_ui_mode),
-        regexCount: Array.isArray(c && c.extensionSettings && c.extensionSettings.regex)
+        regexCount: (!disabledExts.includes('regex') && Array.isArray(c && c.extensionSettings && c.extensionSettings.regex))
             ? c.extensionSettings.regex.length : 0,
         heavy,
         renderMs: state.lastRenderMs,
@@ -1342,7 +1442,7 @@ function renderDiagnostics() {
         ['帧率', fps ? `${fps} FPS` : '采样中', fps && fps < s.fpsThreshold ? 'bad' : (fps && fps < 48 ? 'warn' : 'ok')],
         ['消息条数', String(d.chatLen || d.mesDom), (d.chatLen || d.mesDom) > 300 ? 'warn' : 'ok'],
         ['渲染条数', `${d.mesDom} / 虚拟化${d.virtOn ? '开' : '关'}`, (d.mesDom > 400 && !d.virtOn) ? 'warn' : 'ok'],
-        ['原生截断', d.nativeTrunc ? `最近 ${d.nativeTrunc} 条${d.paging ? '（分页中）' : ''}` : '不限（全量渲染）', d.nativeTrunc ? 'ok' : ((d.chatLen > 300) ? 'warn' : 'ok')],
+        ['原生截断', d.nativeTrunc ? `最近 ${d.nativeTrunc} 条${d.paging ? '（分页中）' : ''}${s.truncApplied ? '（AntiLag 设置）' : ''}` : '不限（全量渲染）', d.nativeTrunc ? 'ok' : ((d.chatLen > 300) ? 'warn' : 'ok')],
         ['上次加载', d.loadMs ? `${d.loadCount} 条 / ${Math.round(d.loadMs)}ms` : '—', d.loadMs > 1200 ? 'warn' : 'ok'],
         ['消息落地', d.renderMs ? `${Math.round(d.renderMs)}ms` : '—', d.renderMs > 120 ? 'bad' : (d.renderMs > 70 ? 'warn' : 'ok')],
         ['ST 逐条 token 计数', d.tokenCounter ? '开（生成/滑动时分词）' : '关', (d.tokenCounter && (d.chatLen || 0) > 200) ? 'warn' : 'ok'],
@@ -1400,166 +1500,8 @@ function renderDiagnostics() {
 }
 
 /* ------------------------------------------------------------------ */
-/* 悬浮仪表                                                            */
+/* 监控                                                                */
 /* ------------------------------------------------------------------ */
-
-function buildHud() {
-    if (state.hudEl) return;
-    const el = document.createElement('div');
-    el.className = 'al-hud';
-    el.dataset.open = 'false';
-    el.dataset.state = 'good';
-    el.innerHTML = `
-        <div class="al-hud-card">
-            <div class="al-hud-head"><span class="al-hud-mode" data-v-mode>轻度</span><span class="al-hud-fpsbig" data-v-fps>--</span></div>
-            <div class="al-hud-row"><span>长任务 10s</span><b data-v-lt>0</b></div>
-            <div class="al-hud-row"><span>消息</span><b data-v-msg>0</b></div>
-            <div class="al-hud-modes">
-                <button type="button" data-preset="lite">轻</button>
-                <button type="button" data-preset="standard">均</button>
-                <button type="button" data-preset="turbo">极</button>
-            </div>
-            <div class="al-hud-actions">
-                <button type="button" class="al-btn al-ghost al-goto">设置</button>
-            </div>
-        </div>
-        <div class="al-hud-pill" title="拖动可移动 / 轻点展开">
-            <span class="al-hud-dot"></span>
-            <span class="al-hud-fps" data-v-pill>--</span>
-            <span class="al-hud-unit">FPS</span>
-        </div>`;
-    document.body.appendChild(el);
-    state.hudEl = el;
-    restoreHudPos();
-
-    const pill = el.querySelector('.al-hud-pill');
-    if (pill) makeDraggable(el, pill);
-
-    el.querySelectorAll('[data-preset]').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            applyPreset(btn.dataset.preset);
-            syncPanel();
-            renderHudCard();
-        });
-    });
-    el.querySelector('.al-goto')?.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openSettingsDrawer();
-    });
-
-    document.addEventListener('pointerdown', (e) => {
-        if (!state.hudOpen) return;
-        if (el.contains(e.target)) return;
-        setHudOpen(false);
-    }, true);
-}
-
-function setHudOpen(open) {
-    state.hudOpen = Boolean(open);
-    if (state.hudEl) state.hudEl.dataset.open = state.hudOpen ? 'true' : 'false';
-}
-
-function makeDraggable(el, handle) {
-    let dragging = false;
-    let moved = false;
-    let startX = 0;
-    let startY = 0;
-    let originX = 0;
-    let originY = 0;
-
-    handle.addEventListener('pointerdown', (e) => {
-        if (e.pointerType === 'mouse' && e.button !== 0) return;
-        dragging = true;
-        moved = false;
-        startX = e.clientX;
-        startY = e.clientY;
-        const r = el.getBoundingClientRect();
-        originX = r.left;
-        originY = r.top;
-        el.style.right = 'auto';
-        el.style.bottom = 'auto';
-        el.style.left = originX + 'px';
-        el.style.top = originY + 'px';
-        el.classList.add('is-dragging');
-        try { handle.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
-    });
-
-    handle.addEventListener('pointermove', (e) => {
-        if (!dragging) return;
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
-        if (!moved && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) moved = true;
-        if (!moved) return;
-        const w = el.offsetWidth;
-        const h = el.offsetHeight;
-        el.style.left = clamp(originX + dx, 4, window.innerWidth - w - 4) + 'px';
-        el.style.top = clamp(originY + dy, 4, window.innerHeight - h - 4) + 'px';
-        e.preventDefault();
-    }, { passive: false });
-
-    const finish = () => {
-        if (!dragging) return;
-        dragging = false;
-        el.classList.remove('is-dragging');
-        if (moved) {
-            const r = el.getBoundingClientRect();
-            state.s.hudPos = { x: Math.round(r.left), y: Math.round(r.top) };
-            save();
-        } else {
-            setHudOpen(!state.hudOpen);
-            if (state.hudOpen) renderHudCard();
-        }
-    };
-    handle.addEventListener('pointerup', finish);
-    handle.addEventListener('pointercancel', () => {
-        dragging = false;
-        el.classList.remove('is-dragging');
-    });
-}
-
-function clampHudToViewport() {
-    const el = state.hudEl;
-    if (!el) return;
-    const vv = window.visualViewport;
-    const vw = (vv && vv.width) || window.innerWidth || 0;
-    const vh = (vv && vv.height) || window.innerHeight || 0;
-    if (!vw || !vh) return;
-    const r = el.getBoundingClientRect();
-    if (r.left < 0 || r.top < 0 || r.left + r.width > vw || r.top + r.height > vh) {
-        el.style.left = clamp(r.left, 4, Math.max(4, vw - r.width - 4)) + 'px';
-        el.style.top = clamp(r.top, 4, Math.max(4, vh - r.height - 4)) + 'px';
-        el.style.right = 'auto';
-        el.style.bottom = 'auto';
-    }
-}
-
-function restoreHudPos() {    if (!state.hudEl) return;
-    const p = state.s && state.s.hudPos;
-    if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) {
-        state.hudEl.style.right = 'auto';
-        state.hudEl.style.bottom = 'auto';
-        state.hudEl.style.left = clamp(p.x, 4, Math.max(4, window.innerWidth - 70)) + 'px';
-        state.hudEl.style.top = clamp(p.y, 4, Math.max(4, window.innerHeight - 70)) + 'px';
-    }
-}
-
-function renderHudCard() {
-    if (!state.hudEl || !state.s) return;
-    const lt = recentLongTasks();
-    const c = ctx();
-    const msgs = c && Array.isArray(c.chat) ? c.chat.length : countMessages();
-    const modeEl = state.hudEl.querySelector('[data-v-mode]');
-    if (modeEl) modeEl.textContent = modeLabel();
-    const fpsEl = state.hudEl.querySelector('[data-v-fps]');
-    if (fpsEl) fpsEl.textContent = state.fps ? `${state.fps} FPS` : '-- FPS';
-    const ltEl = state.hudEl.querySelector('[data-v-lt]');
-    if (ltEl) ltEl.textContent = `${lt.count} 次 / ${Math.round(lt.max)}ms`;
-    const msgEl = state.hudEl.querySelector('[data-v-msg]');
-    if (msgEl) msgEl.textContent = String(msgs);
-    const mode = detectMode();
-    state.hudEl.querySelectorAll('[data-preset]').forEach((b) => b.classList.toggle('is-active', b.dataset.preset === mode));
-}
 
 function recentLongTasks() {
     const now = performance.now();
@@ -1568,61 +1510,52 @@ function recentLongTasks() {
     return { count: state.longTasks.length, max };
 }
 
-function updateHud() {
-    const el = state.hudEl;
-    if (!el || !state.s) return;
-    const pill = el.querySelector('[data-v-pill]');
-    if (pill) pill.textContent = state.fps ? String(state.fps) : '--';
-    if (!state.s.enabled || isPaused()) el.dataset.state = 'off';
-    else if (!state.fps) el.dataset.state = 'good';
-    else if (state.fps < state.s.fpsThreshold) el.dataset.state = 'bad';
-    else if (state.fps < 48) el.dataset.state = 'warn';
-    else el.dataset.state = 'good';
-    if (state.hudOpen) renderHudCard();
+function panelVisible() {
+    if (!state.panelEl) return false;
+    const drawer = state.panelEl.closest('.drawer-content');
+    if (drawer) return drawer.classList.contains('openDrawer');
+    return Boolean(state.panelEl.getClientRects && state.panelEl.getClientRects().length);
 }
 
-function openSettingsDrawer() {
-    setHudOpen(false);
-    const btn = document.getElementById('extensions-settings-button');
-    if (btn && !document.getElementById('right-nav-panel')?.classList.contains('openDrawer')) {
-        btn.click();
-    }
-    setTimeout(() => {
-        if (state.panelEl) {
-            state.panelEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            state.panelEl.classList.add('al-flash');
-            setTimeout(() => state.panelEl?.classList.remove('al-flash'), 900);
+function needsFps() {
+    // 只有开启自动降级或用户正在看体检面板时才需要采样；否则连 rAF 循环都停掉
+    return Boolean(state.s && state.s.enabled && !isPaused() && (state.s.autoDetect || panelVisible()));
+}
+
+function startFpsLoop() {
+    if (state.raf || document.hidden) return;
+    state.startedAt = performance.now();
+    state.lastSec = state.startedAt;
+    state.frames = 0;
+    const loop = (t) => {
+        state.raf = requestAnimationFrame(loop);
+        if (document.hidden) {
+            state.frames = 0;
+            state.lastSec = t;
+            return;
         }
-    }, 420);
+        state.frames++;
+        const delta = t - state.lastSec;
+        if (delta >= 1000) {
+            const fps = Math.round((state.frames * 1000) / delta);
+            state.frames = 0;
+            state.lastSec = t;
+            onFps(fps);
+        }
+    };
+    state.raf = requestAnimationFrame(loop);
 }
 
-/* ------------------------------------------------------------------ */
-/* 监控                                                                */
-/* ------------------------------------------------------------------ */
+function stopFpsLoop() {
+    if (!state.raf) return;
+    cancelAnimationFrame(state.raf);
+    state.raf = 0;
+    state.frames = 0;
+    state.fps = 0;
+}
 
 function startMonitor() {
     if (!state.s) return;
-    if (!state.raf) {
-        state.startedAt = performance.now();
-        state.lastSec = state.startedAt;
-        const loop = (t) => {
-            state.raf = requestAnimationFrame(loop);
-            if (document.hidden) {
-                state.frames = 0;
-                state.lastSec = t;
-                return;
-            }
-            state.frames++;
-            const delta = t - state.lastSec;
-            if (delta >= 1000) {
-                const fps = Math.round((state.frames * 1000) / delta);
-                state.frames = 0;
-                state.lastSec = t;
-                onFps(fps);
-            }
-        };
-        state.raf = requestAnimationFrame(loop);
-    }
 
     if (!state.po) {
         try {
@@ -1643,14 +1576,21 @@ function startMonitor() {
 
     if (state.tickTimer) clearInterval(state.tickTimer);
     state.tickTimer = setInterval(() => {
-        if (document.hidden) return;
-        updateHud();
-        state.diagTick++;
-        if (state.diagTick >= 10) {
+        if (document.hidden || !state.s || !state.s.enabled) return;
+        if (needsFps()) {
+            if (!state.raf) startFpsLoop();
+        } else if (state.raf) {
+            stopFpsLoop();
+        }
+        // 面板不可见时不需要刷新 UI，避免每 10 秒做一批 querySelector/getComputedStyle
+        if (!panelVisible()) {
             state.diagTick = 0;
-            if (state.panelEl && document.getElementById('right-nav-panel')?.classList.contains('openDrawer')) {
-                renderDiagnostics();
-            }
+            return;
+        }
+        state.diagTick++;
+        if (state.diagTick >= 5) {
+            state.diagTick = 0;
+            renderDiagnostics();
             syncPanel();
         }
     }, 1000);
@@ -1723,6 +1663,14 @@ function observeChat() {
     scheduleSweep();
 }
 
+/** 停止性能观察器（禁用扩展时不做无意义的 longtask / 输入延迟采集） */
+function stopPerfObservers() {
+    try { state.po?.disconnect(); } catch (err) { /* 忽略 */ }
+    try { state.eventPo?.disconnect(); } catch (err) { /* 忽略 */ }
+    state.po = null;
+    state.eventPo = null;
+}
+
 function pauseObserver() {
     if (state.observer && state.observerOn) {
         state.observer.disconnect();
@@ -1737,8 +1685,6 @@ function mountUi() {
             renderDiagnostics();
             syncPanel();
         }
-        if (!state.hudEl) buildHud();
-        if (state.s && state.s.hud && state.hudEl) state.hudEl.style.display = '';
         if (!state.panelEl && state.mountTries < 30) {
             state.mountTries++;
             setTimeout(mountUi, 600);
@@ -1758,31 +1704,40 @@ function registerEvents() {
     const on = (name, fn) => {
         const type = et[name];
         if (!type) return;
-        try { es.on(type, fn); } catch (err) { /* 忽略 */ }
+        // 总开关关闭后事件仍会来，这里统一拦掉，避免禁用状态还在排队扫描
+        const guarded = (...args) => {
+            if (!state.s || !state.s.enabled) return;
+            try { fn(...args); } catch (err) { console.warn('[AntiLag] 事件处理失败', name, err); }
+        };
+        try { es.on(type, guarded); } catch (err) { /* 忽略 */ }
     };
 
     on('APP_READY', () => { state.mountTries = 0; mountUi(); observeChat(); hookScrollIdle(); startInputTiming(); });
     on('APP_INITIALIZED', () => { mountUi(); });
+    on('CHAT_LOADED', () => {
+        // 这个事件在 printMessages 之前触发：从这里开始计时，才能覆盖真正的解析+渲染
+        state.chatLoading = true;
+        state.chatLoadT0 = performance.now();
+    });
     on('CHAT_CHANGED', () => {
         state.trimExpanded = false;
         state.trimSig = '';
-        state.chatLoadT0 = performance.now();
-        state.chatLoadMs = 0;
+        state.chatLoading = false;
         applyAll();
         hookScrollIdle();
         scheduleSweep();
-    });
-    on('CHAT_LOADED', () => {
-        // 等到两帧之后计时，才包含真正的渲染与绘制，而不是只算消息解析
-        const t0 = state.chatLoadT0 || performance.now();
-        requestAnimationFrame(() => requestAnimationFrame(() => {
-            const c = ctx();
-            state.chatLoadMs = performance.now() - t0;
-            state.chatLoadCount = c && Array.isArray(c.chat) ? c.chat.length : countMessages();
-            state.chatLoadT0 = 0;
-            if (isOn()) scheduleMeasureCvSize();
-            scheduleSweep();
-        }));
+        // 等两帧后才包含绘制完成；没有前置 CHAT_LOADED 的场景不记这个指标
+        const t0 = state.chatLoadT0;
+        state.chatLoadT0 = 0;
+        if (t0) {
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                const c = ctx();
+                state.chatLoadMs = performance.now() - t0;
+                state.chatLoadCount = c && Array.isArray(c.chat) ? c.chat.length : countMessages();
+                if (isOn()) scheduleMeasureCvSize();
+                scheduleSweep();
+            }));
+        }
     });
     on('MESSAGE_RECEIVED', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
     on('MESSAGE_SENT', () => { measureRender(); hotZoneTick(); scheduleSweep(); });
@@ -1817,7 +1772,7 @@ function registerEvents() {
         restoreStreamFadeSkip();
         observeChat();
         scheduleSweep();
-        if (state.panelEl) renderDiagnostics();
+        if (panelVisible()) renderDiagnostics();
     };
     on('GENERATION_ENDED', endGen);
     on('GENERATION_STOPPED', endGen);
@@ -1836,15 +1791,8 @@ function init() {
         hookScrollIdle();
         registerEvents();
         startMonitor();
+        if (needsFps()) startFpsLoop();
         startInputTiming();
-
-        window.addEventListener('resize', () => {
-            clampHudToViewport();
-        });
-        // 手机键盘弹出/收起走 visualViewport，普通的 resize 不一定触发
-        if (window.visualViewport) {
-            window.visualViewport.addEventListener('resize', clampHudToViewport);
-        }
 
         console.log(`[AntiLag] v${VERSION} ready (${modeLabel()})`);
     } catch (err) {
@@ -1866,6 +1814,10 @@ export function onDisable() {
     restoreStreamFadeSkip();
     state.s.enabled = false;
     applyAll();
+    pauseObserver();
+    stopFpsLoop();
+    stopPerfObservers();
+    if (state.tickTimer) { clearInterval(state.tickTimer); state.tickTimer = 0; }
     return Promise.resolve();
 }
 
@@ -1884,6 +1836,8 @@ export function onEnable() {
     registerEvents();
     startMonitor();
     startInputTiming();
+    // 禁用时停掉了 rAF，重新启用必须拉回来，否则自动降级不会工作
+    if (needsFps()) startFpsLoop();
     return Promise.resolve();
 }
 
@@ -1892,14 +1846,21 @@ export function onCleanUp() {
     try { restoreStreamFps(); } catch (err) { /* 忽略 */ }
     try { restoreNativeLimit(); } catch (err) { /* 忽略 */ }
     try { restoreStreamFadeSkip(); } catch (err) { /* 忽略 */ }
+    if (state.tickTimer) { clearInterval(state.tickTimer); state.tickTimer = 0; }
+    stopFpsLoop();
+    pauseObserver();
+    try { state.po?.disconnect(); } catch (err) { /* 忽略 */ }
+    try { state.eventPo?.disconnect(); } catch (err) { /* 忽略 */ }
+    state.po = null;
+    state.eventPo = null;
+    state.eventsBound = false;
+    try { clearStructural(); } catch (err) { /* 忽略 */ }
     ['antilag', 'antilag-virt', 'antilag-contain', 'antilag-gen', 'antilag-scrolling']
         .forEach((cls) => document.body && document.body.classList.remove(cls));
     if (document.documentElement) document.documentElement.classList.remove('antilag');
     if (state.styleEl) state.styleEl.remove();
     state.styleEl = null;
     document.getElementById('al-cv-style')?.remove();
-    if (state.hudEl) state.hudEl.remove();
-    state.hudEl = null;
     if (state.panelEl) state.panelEl.remove();
     state.panelEl = null;
     return Promise.resolve();

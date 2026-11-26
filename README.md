@@ -39,7 +39,7 @@
 | `power_user.message_token_count_enabled` 默认 **false**，开启后消息落地与滑动都要 `getTokenCountAsync` | 这是可归因的额外分词开销，不是玄学 | 体检新增「ST 逐条 token 计数」并给建议；**不擅自改你的设置** |
 | `power_user.auto_fix_generated_markdown` 默认 **true**，每次渲染对整条消息跑 `fixMarkdown` | 长消息渲染成本之一 | 体检显示状态（同样只报告，不动设置） |
 | `MESSAGE_RECEIVED` / `*_MESSAGE_RENDERED` 在 `append` + `scrollChatToBottom` 之后触发 | 能量「消息落地后到稳定一帧」的真实收尾耗时（含 TTS/总结类扩展） | 体检新增「消息落地」 |
-| 手机键盘弹出/收起走 `visualViewport`，普通 `resize` 不一定触发 | 悬浮仪表会被顶出屏幕外 | HUD 监听 `visualViewport.resize`，并夹回可视区 |
+| 手机键盘弹出/收起走 `visualViewport`，普通 `resize` 不一定触发 | 只影响悬浮 UI 的定位，与卡顿无关 | v1.3 曾让 HUD 监听；v1.6 已移除 HUD，不再需要这段 |
 | 切聊天、连发多条会连续触发一串 `MESSAGE_*` 事件 | 每个事件都全量扫一遍 DOM 是白烧 CPU | sweep 改为 300ms 去抖 + `requestIdleCallback(timeout 600)`（不支持则立即执行） |
 
 用法建议：消息量很大（500+）且不介意顶部有「Show more」时，优先用「借用 ST 原生分页」设 150–300，比本扩展自己折叠更稳，也更接近 ST 作者的设计意图。
@@ -55,7 +55,7 @@
 | 新增 `power_user.stream_fade_in`（默认关）：开启后**每个流式 tick** 都会 clone 整条消息 → `Intl.Segmenter` 把每个词包成 `<span class="text_segment">` → `morphdom` 全树 diff（`scripts/util/stream-fadein.js`） | 长消息 + 30 FPS 下这是数量级最贵的单项，比降频还狠 | 新增「生成时临时关闭流式淡入」开关：只在生成期把 ST 该项设为 false，生成结束、暂停、停用、清理都会还原（`fadeApplied` 记录，防止中途崩溃丢设置）；体检里显示它是否开着 |
 | ST 的 `messageFormatting` 没有任何缓存，每次渲染整条消息都要重跑宏/正则/净化/Markdown | 任何「重渲染」都是全量成本，优化只能减少次数与频率 | 已有生成轻量渲染 + 流式降频；v1.4 再把「最后一条流式消息」强制 `content-visibility: visible`，确保它不会因为热区判定滞后被虚拟化跳过 |
 | `fast_ui_mode`（默认 **true**）通过 `body.no-blur * {backdrop-filter: unset}` 全局去模糊 | 默认配置下聊天区毛玻璃本来就已经没了；此时再点「关闭毛玻璃」看不到变化是正常的 | 体检新增「ST 快速 UI」行，并提示这是 ST 原生的一键全界面去模糊方式；不再让用户误以为开关失效 |
-| `smooth_streaming` / `smooth_streaming_no_think` / `smooth_streaming_speed` 在 1.19.1 里仍然只有设置读写，没有任何消费点 | 它是个遗留 UI，开了也不会「更平滑」或「更卡」 | README 明确标注，不再把它当作可优化项 |
+| `smooth_streaming*` 只被 `scripts/sse-stream.js` 当作**人为延迟**使用（`getDelay()` 按标点加停顿） | 它不是性能开关：开了只是把流放慢，不会更卡；v1.4 曾误判为「无消费点」，v1.6 更正 | 不把它当优化项，也不擅自关；想更快看到完整输出可自行关闭 |
 | `#show_more_messages` 的分页补偿逻辑与 1.19.1 一致（`prevHeight` → 前插 → `newHeight - prevHeight` 补 `scrollTop`） | v1.3 的「有分页就不虚拟化」判断在新版本仍然必要 | 保持不变，并在体检里标注「分页中」 |
 | 正则脚本挂在 `extension_settings.regex`，`getRegexedString` 在每次消息渲染/推理更新时全量跑一遍 | 脚本越多，单条渲染越慢，且与消息数无关 | 体检新增「正则脚本」计数，>5 条给「精简不常用的脚本」建议 |
 | 消息 DOM 结构、事件名（`CHAT_CHANGED='chat_id_changed'`、`MORE_MESSAGES_LOADED` 等）、`#curEditTextarea` / `.reasoning_edit_textarea`、`#extensions_settings2`、`#right-nav-panel` 全部未变 | 扩展的挂钩点没有失效 | 无需迁移；v1.4 的改动都在这些稳定挂钩之内 |
@@ -82,6 +82,35 @@
 
 ---
 
+## v1.6 做了什么：第五轮全仓库核查（修正错项 + 去掉悬浮窗）
+
+这一轮把整棵 `public/` 前端源码重新过了一遍，重点是「我们写的优化到底打没打中」和「扩展自己有没有在空转」。结论：有 4 处优化项打错了目标，若干处自身开销可以省掉，HUD 按你的要求整体移除。
+
+| 在 ST 1.19.1 源码里查到的事实 | v1.5 及以前的问题 | v1.6 的修正 |
+| --- | --- | --- |
+| 真正带 `background-attachment: fixed` 的是 `#bg1`（`public/css/backgrounds.css` 第 2 行），`body` / `#chat` / `.background` 都没有 | 「停用动画背景」实际几乎没生效，fixed 背景还在每帧重绘 | 规则改为直接命中 `#bg1`、`#bg_custom`、`#bg_custom_content`：`background-attachment: scroll` + 去掉背景切换过渡 |
+| 滑动动画 `.slide` 靠 `will-change: transform` 预提升（`style.css` 第 1238 行） | 「清理 will-change」把 `#chat *` 全清了，滑动时反而少一层合成提示 | 规则改为 `#chat *:not(.slide)`，只清主题滥用，不动 ST 自己的滑动提示 |
+| `.last_mes` 在生成期被加了 `contain: layout paint style` | `paint` 会把消息内溢出内容裁掉（阴影、悬浮操作、超宽代码块） | 降为 `contain: layout`，只隔离布局传播，不裁剪绘制 |
+| `contain-intrinsic-size: auto <len>` 在部分浏览器（尤其旧 Firefox）不支持 `auto` 关键字，整条声明会被丢弃 | 一旦声明失效，被跳过的消息按 0 高度记账，滚动条会大跳 | 同时写两行：`contain-intrinsic-size: var(--al-cv-size,240px)` 兜底，再用 `auto …` 覆盖；不支持的浏览器至少还有实测中位高度 |
+| 实测中位高度原来抽样 `.mes:not(.al-hot)` | 抽到的正是被虚拟化的元素，`getBoundingClientRect()` 返回的是估高，等于拿估算校准估算 | 改为只量热区 `.mes.al-hot`（永远真实渲染）的真实高度 |
+| `applyHotZone()` 每次扫描都遍历全部消息做 `classList.contains` | 3000 条聊天里每次增删消息都要 O(n) 跑一遍 | 只处理尾部 30 条；只有消息总数变化时才清理一次旧热区；消息计数改用 `getElementsByClassName('mes').length` 的 live collection |
+| 关闭「折叠历史 / 超长折叠」时，`applyTrim/applyClip` 仍然先 `querySelectorAll` 建数组、算签名 | 开关关着也在每次扫描时做无用功 | 先做一次廉价的「有没有残留类」检查，没有就直接返回 |
+| 懒加载只加属性，没有撤销路径 | 关掉「图片懒加载」后，`loading=lazy` / `decoding=async` 仍留在消息里 | 记录哪些属性是本扩展加的（`data-al-loading/decoding`），关闭或清理时精确移除；`loading` 原本就有的不动 |
+| rAF 帧率循环无条件常驻；1 秒定时器每 10 秒 `syncPanel + renderDiagnostics` | 关掉自动降级、面板也关着时，仍在 60Hz 唤醒主线程、定期做 `getComputedStyle` | 帧率循环只在「自动降级开 或 体检面板可见」时运行，否则连 rAF 都取消；体检刷新只在面板可见时做 |
+| 面板可见性原来判断 `#right-nav-panel` 是否 `openDrawer` | 本扩展挂在 `#extensions_settings2`，它的抽屉是 `#rm_extensions_block`——原判断几乎永远为假，10 秒自动体检其实从没跑过 | 改为 `panelEl.closest('.drawer-content').classList.contains('openDrawer')`，与 ST 真实 DOM 一致 |
+| 毛玻璃体检只抽样 `.mes` | `backdrop-filter` 真正在 `#chat` / `#send_form` / `#top-bar` 容器上，消息本身通常没有 → 误报「无毛玻璃」 | 先查这 4 个容器，再抽样消息；`filter` 只认 `blur(` / `drop-shadow(`，不再把头像灰度算成模糊 |
+| `extension_settings` 里混着 `apiUrl`、`apiKey`、`note`、`disabledExtensions` 等非扩展键 | 「已启用扩展」数量虚高，归因不准 | 排除元数据键，并跳过 `disabledExtensions` 里的名字 |
+| `chat_truncation` 只在 `printMessages` 时消费 | 改「借用 ST 原生分页」后当前聊天不重渲染，要等下次切聊天才生效 | 改完 400ms 去抖调用 `getContext().printMessages()` 重新渲染（生成中/加载中跳过） |
+| `CHAT_LOADED` 在 `printMessages()` **之前**触发，`CHAT_CHANGED` 在渲染**之后**触发（`getChatResult()`） | 「上次加载」从 `CHAT_CHANGED` 才开始计时，只量到最后两帧，永远显示 ~30ms | 改为 `CHAT_LOADED` 起表、`CHAT_CHANGED` 后两帧停表，才覆盖「解析 + 渲染 + 绘制」 |
+| `smooth_streaming*` 被 `sse-stream.js` 消费（人为延迟），不是死设置 | v1.4 的结论错了，文档会误导 | 更正文档；不提供开关，避免把「放慢输出」当成优化 |
+
+另外两处按你的要求直接砍掉：
+
+- **悬浮仪表（HUD）整体移除**：不再有右下角小球、拖拽定位、`visualViewport` 夹取、`hud/hudPos` 设置、HUD 专属 CSS 与 `al-pulse` 动画。看帧率请打开扩展面板的「运行体检」，那里有同一套数据，而且不占屏幕、不拦截点击。
+- **常驻开销再削一层**：禁用扩展时停掉 rAF 采样与 `MutationObserver`，清理时关定时器、断开两个 `PerformanceObserver`、撤掉懒加载属性与折叠类；启用时再恢复。
+
+---
+
 ## 设计原则：先不打扰，再谈优化
 
 1. **默认「轻度」档视觉零改动**：只做不可见的减负（虚拟化、懒加载、生成隔离、清理 will-change、滚动期降载）。
@@ -90,7 +119,8 @@
 4. **每次切样式先记 `#chat` 滚动位置再回填**；贴底时保持贴底。
 5. **自动降级只动视觉开销**，绝不自动隐藏内容，也不写你的设置。
 6. **和 ST 原生功能不重复**：原生已截断历史时，本扩展不再折叠。
-7. **改 ST 设置必须能还**：流式降频会记录原值，停用 / 暂停 / 选回「不改」都会还原。
+7. **改 ST 设置必须能还**：流式降频会记录原值与「我们写进去的值」，停用 / 暂停 / 选回「不改」都会还原；你若中途自己改过 ST 设置，就不覆盖你的值。
+8. **不占屏、不拦截操作**：不做悬浮窗；所有入口都在扩展面板里。
 
 ---
 
@@ -136,18 +166,17 @@
 
 **面板位置**：`扩展` 抽屉 → 最下方 `AntiLag 流畅优化` 卡片（高级项折叠收纳，不占屏）。
 
-- **三档模式**：轻度 / 均衡 / 极速，一键切换；HUD 里也能快捷切档。
+- **三档模式**：轻度 / 均衡 / 极速，一键切换（入口只在扩展面板，不再有悬浮窗）。
 - **体验保护**：编辑消息（含推理块）时暂停、选中文本时暂停、切换保持滚动位置、暂停 10 分钟做 A/B。
-- **滚动期降载**：滚动中暂时屏蔽消息按钮的 hover 命中与过渡，停手立刻恢复。
+- **滚动期降载**：滚动中暂时屏蔽消息按钮的 hover 命中与过渡，停手立刻恢复；可选「滚动时临时关模糊」（默认关，低配机可开，会有一瞬视觉跳变）。
 - **渲染减负**：消息虚拟化（阈值 30–500，热区 30 条永不虚拟化）、生成时轻量渲染、正文图片/iframe 懒加载（头像不碰）、清理 will-change、关毛玻璃、停动画背景、关阴影、关过渡、`contain` 隔离聊天区。
 - **生成时临时关闭流式淡入**（新）：ST 的淡入每个 tick 都要整条消息重新分词并 morphdom，长消息时关掉收益很大；只在生成期生效，结束自动还原。
 - **流式降频**（新）：把 ST 的流式刷新上限压到 20/15/10 FPS，明显减少「正则+净化+Markdown」的重复解析；原值会被记录并在停用时还原。
-- **借用 ST 原生分页**（新）：把 ST 自己的「聊天截断」设成 100/150/300 条，只渲染最近 N 条、顶部「Show more」可翻回；改的是 ST 原生显示设置，可还原，且不改变发给模型的上文。
+- **借用 ST 原生分页**：把 ST 自己的「聊天截断」设成 100/150/300 条，只渲染最近 N 条、顶部「Show more」可翻回；改完会调用 ST 的 `printMessages` 立即重渲染，可还原，且不改变发给模型的上文。
 - **历史管理**：折叠较早消息（默认关）；检测到 ST 原生分页时自动跳过；顶部「展开」随时还原，不删数据。
 - **超长消息折叠**：单条超过阈值（默认 3000 字）先显示前段，点「展开全文」。
 - **体检与归因**：帧率、消息条数、**实际渲染条数/虚拟化状态**、**原生截断（含是否分页中）**、**上次加载耗时**、**消息落地耗时**、**输入延迟（10s 最大）**、**生成期长任务 + TPS**、**ST 流式 FPS**、**流式淡入状态**、**ST 快速 UI 状态**、**正则脚本数**、**重型扩展**、**ST 逐条 token 计数状态**、DOM 节点、毛玻璃元素、will-change、动画背景、最长消息、图片数、扩展数，并按红黄项给建议。
 - **自动降级**：连续 3 秒低于阈值（默认 28 FPS）→ 临时升级到「极速视觉」（不折叠内容），恢复 12 秒后自动退出，不写设置。
-- **悬浮仪表**：右下角可拖动小球，显示实时 FPS，轻点展开详情（模式、长任务、消息数 + 三档快捷切换）。
 
 ---
 
@@ -233,22 +262,22 @@ https://github.com/Neohero521/SillyTavern-AntiLag
 | ST 快速 UI | `fast_ui_mode` / `body.no-blur` | 开着说明毛玻璃已全局去掉，本扩展的毛玻璃开关不会再有额外变化 |
 | 正则脚本 | `extension_settings.regex` 条数 | >5 条且单条消息渲染慢 → 精简不常用的脚本 |
 | 重型扩展 | 按 `disabledExtensions` 过滤后的 expressions/vectors/caption/translate/tts/memory/quickReply/sd/regex | 同时开 2 个以上且卡 → 先停用不用的，它们会随消息/生成额外触发 |
-| 毛玻璃元素 | 抽样 30 条消息中含 `backdrop-filter`/`filter` 的数量 | 大于 0 就值得关掉 |
+| 毛玻璃元素 | `#chat/#send_form/#form_sheld/#top-bar` + 抽样 30 条消息中含 `backdrop-filter` / `blur` / `drop-shadow` 的数量 | 大于 0 就值得关掉；ST 快速 UI 开着时本来就为 0 |
 | will-change | 抽样消息里非 auto 的 will-change 数量 | >2 说明主题在滥用 |
 | 动画背景 | 背景是否在动或 fixed | 是则滚动必掉帧 |
 | 最长消息 | 最近 40 条里最长的字符数 | 超过 5000 字建议开超长折叠 |
-| 已启用扩展 | `extension_settings` 模块数 | 超过 10 个建议逐个排查 |
+| 已启用扩展 | `extension_settings` 里排除元数据、排除 `disabledExtensions` 后的模块数 | 超过 10 个建议逐个排查 |
 
 ---
 
 ## 技术实现
 
 - 只用 `SillyTavern.getContext()` 稳定 API：`eventSource` / `eventTypes` / `extensionSettings` / `powerUserSettings` / `saveSettingsDebounced`，不 import 内部模块。
-- 所有样式注入挂在 `html.antilag` / `body.antilag` 根类上，关总开关即整段移除。
-- 虚拟化：`content-visibility: auto` 只作用于「热区之外」（最近 30 条永远真实渲染），`contain-intrinsic-size: auto <实测中位高度>` 保证滚动条不抖；阈值以下完全不介入。
-- 帧率用 `requestAnimationFrame` 分秒采样；长任务用 `PerformanceObserver({entryTypes:['longtask']})`；输入延迟用 `PerformanceObserver({type:'event', durationThreshold:104})`；不支持则静默降级。
+- 所有样式注入挂在 `html.antilag` / `body.antilag` 根类上，关总开关即整段移除；没有常驻悬浮窗。
+- 虚拟化：`content-visibility: auto` 只作用于「热区之外」（最近 30 条永远真实渲染），`contain-intrinsic-size` 先用实测中位高度兜底、再用 `auto` 记忆真实高度；中位高度只从热区真实渲染的消息里量。
+- 帧率用 `requestAnimationFrame` 分秒采样，但只在「自动降级开启 或 体检面板可见」时运行；长任务用 `PerformanceObserver({entryTypes:['longtask']})`；输入延迟用 `PerformanceObserver({type:'event', durationThreshold:104})`；不支持则静默降级。
 - 生成期由 `GENERATION_STARTED / GENERATION_ENDED / GENERATION_STOPPED` 驱动：进入时断开 `MutationObserver`（不跟流式抢主线程），结束时重连并补扫。
-- 页面隐藏时跳过扫描与刷新，回来再补。
+- 页面隐藏时跳过扫描与刷新；面板不可见时不做定期体检渲染；禁用后停掉 rAF 与观察器。
 - `MutationObserver` 只观察 `#chat` 的 `childList`（消息是直接子节点），消息内容变化走 ST 事件，不做全子树观察。
 - 设置存 `extension_settings['antilag']`；暂停带时间戳，过期自动恢复。
 - `manifest.hooks`：`disable → onDisable`、`enable → onEnable`、`clean → onCleanUp`。
@@ -262,7 +291,7 @@ https://github.com/Neohero521/SillyTavern-AntiLag
 - **关闭毛玻璃**：视觉会明显变朴素（这是它的原理）。
 - **折叠历史 / 超长折叠**：只裁显示不删数据，都能一键还原；切聊天后折叠状态重置。
 - **`contain: layout`**：极速档启用；若主题依赖「聊天区撑开页面高度」，可关掉该项。
-- **流式降频**：改的是 ST 全局设置 `streaming_fps`。本扩展会记录原值并在停用/暂停/选回「不改」时还原；**但如果你在扩展限流期间手动去 ST 设置里改过流式 FPS，或者先禁用扩展再保存设置，原值可能已被覆盖**——最稳的做法是关扩展前把「流式降频」调回「不改」。
+- **流式降频**：改的是 ST 全局设置 `streaming_fps`。本扩展会记录原值并在停用/暂停/选回「不改」时还原；**但如果你在扩展限流期间手动去 ST 设置里改过流式 FPS，本扩展不会覆盖你改后的值**（只还原仍等于它写进去的那个值）；若你先禁用扩展再保存设置，原值可能已被覆盖——最稳的做法是关扩展前把「流式降频」调回「不改」。
 - **不支持 `longtask` / `event` timing 的浏览器**：对应体检项为空，其余功能正常。
 
 ---
@@ -272,13 +301,14 @@ https://github.com/Neohero521/SillyTavern-AntiLag
 ```
 antilag/
 ├── manifest.json   # 扩展清单（loading_order: 100，hooks: disable/enable/clean）
-├── index.js        # 面板 / HUD / 体检 / 归因 / 自动降级 / 生命周期钩子
-├── style.css       # 面板、模式卡、折叠组与悬浮仪表样式（暗色鎏金，移动端适配）
+├── index.js        # 面板 / 体检 / 归因 / 自动降级 / 生命周期钩子
+├── style.css       # 面板、模式卡、折叠组样式（暗色鎏金，移动端适配）
 └── README.md
 ```
 
 ## 版本
 
+- **v1.6.0**：第五轮全仓库核查——移除悬浮仪表；修正「停用动画背景」未命中 `#bg1`、`will-change` 误清 `.slide`、生成期 `contain:paint` 裁切、`contain-intrinsic-size` fallback、中位高度抽样虚拟化元素等错项；折叠/裁剪关闭时不再空扫；懒加载可精确撤销；帧率采样与体检刷新按需启停（并修正面板可见性判断错抽屉）；原生分页改完立即重渲染；修正「上次加载」计时起点；更正 `smooth_streaming` 结论。
 - **v1.5.0**：第四轮核查——体检按 `disabledExtensions` 真实启停归因，新增「重型扩展」；确认存档/媒体/首屏加载不属可安全干预范围（只归因不改）；「超长消息折叠」改为签名 + dirty 标记，避免长聊天里每次全量扫文本；节点统计改用 live collection。
 - **v1.4.0**：第三轮源码核查（release 1.19.1）——新增「生成时临时关闭流式淡入」（`stream_fade_in` 每 tick 的 Segmenter + morphdom 是当前最贵的单项，可记录/还原）；生成期最后一条强制 `content-visibility: visible` 并补热区标记；体检新增「流式淡入 / ST 快速 UI / 正则脚本」并修正提示；确认 1.19.1 的 `smooth_streaming` 仍无消费点。
 - **v1.3.0**：第二轮源码核查——原生分页与虚拟化互斥（`show_more_messages` 存在即不虚拟化/不折叠）；新增「借用 ST 原生分页」并记录/还原原值（用户改过则尊重用户）；懒加载限定 `.mes_block img/iframe`，头像不再被懒加载；sweep 改 300ms 去抖 + `requestIdleCallback`；体检新增「消息落地 / ST 逐条 token 计数 / 分页中」；HUD 监听 `visualViewport` 防被键盘顶出屏幕。
